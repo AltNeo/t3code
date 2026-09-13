@@ -1,0 +1,72 @@
+name: Windows Pi feature build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Fork workflows cannot receive upstream push events directly; poll hourly.
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/pi-provider
+          fetch-depth: 0
+
+      - name: Merge latest upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+          git merge --no-commit --no-ff upstream/main
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        shell: pwsh
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Ensure Electron runtime
+        shell: pwsh
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build unsigned installer
+        shell: pwsh
+        run: >-
+          vp run dist:desktop:artifact
+          --platform win
+          --target nsis
+          --arch x64
+          --build-version 0.0.41-test.${{ github.run_number }}
+          --verbose
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-code-windows-x64
+          retention-days: 30
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/*.yml
+          if-no-files-found: error
