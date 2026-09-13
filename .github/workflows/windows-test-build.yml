@@ -1,4 +1,4 @@
-name: Windows Pi feature build
+name: Windows Pi nightly
 
 on:
   workflow_dispatch:
@@ -10,8 +10,51 @@ permissions:
   contents: read
 
 jobs:
+  check-upstream:
+    name: Check upstream main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+    steps:
+      - id: check
+        name: Check for a new upstream commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const upstream = await github.rest.repos.getCommit({
+              owner: "pingdotgg",
+              repo: "t3code",
+              ref: "main",
+            });
+            const upstreamSha = upstream.data.sha;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const latestPiNightly = releases.find(
+              (release) =>
+                release.prerelease &&
+                !release.draft &&
+                release.name.startsWith("T3 Code Pi Nightly") &&
+                /upstream-main-sha: [0-9a-f]{40}/i.test(release.body ?? ""),
+            );
+            const previousSha = latestPiNightly?.body?.match(
+              /upstream-main-sha: ([0-9a-f]{40})/i,
+            )?.[1];
+            const shouldBuild = context.eventName !== "schedule" || previousSha !== upstreamSha;
+            core.setOutput("should_build", String(shouldBuild));
+            core.setOutput("upstream_sha", upstreamSha);
+            core.notice(
+              `${shouldBuild ? "Building" : "Skipping"} upstream main ${upstreamSha}`,
+            );
+
   build-wsl-node-pty:
     name: Build WSL node-pty (linux-x64)
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -60,10 +103,16 @@ jobs:
 
   build:
     name: Build Windows installer
-    needs: build-wsl-node-pty
+    needs: [check-upstream, build-wsl-node-pty]
+    if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      upstream_sha: ${{ needs.check-upstream.outputs.upstream_sha }}
     env:
+      # These are public identifiers, documented in .env.example and embedded
+      # in official T3 Code builds. They are not secrets.
       T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
       T3CODE_CLERK_JWT_TEMPLATE: t3-relay
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
@@ -104,6 +153,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - id: version
+        name: Resolve nightly version
+        shell: bash
+        run: echo "version=0.0.42-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
       - name: Download WSL node-pty prebuild
         uses: actions/download-artifact@v4
         with:
@@ -118,7 +172,7 @@ jobs:
           --target nsis
           --arch x64
           --wsl-prebuild "${{ github.workspace }}\wsl-prebuild\pty.node"
-          --build-version 0.0.41-test.${{ github.run_number }}
+          --build-version "${{ steps.version.outputs.version }}"
           --verbose
 
       - name: Upload installer
@@ -131,3 +185,35 @@ jobs:
             release/*.blockmap
             release/*.yml
           if-no-files-found: error
+
+  release:
+    name: Publish nightly release
+    needs: [check-upstream, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: t3-code-windows-x64
+          path: release
+
+      - name: Publish GitHub nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          name: T3 Code Pi Nightly ${{ needs.build.outputs.version }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          body: |
+            Automated unsigned Windows build for the Pi provider branch.
+
+            upstream-main-sha: ${{ needs.build.outputs.upstream_sha }}
+            feature-ref: feat/pi-provider
+          files: release/*
+          fail_on_unmatched_files: true
