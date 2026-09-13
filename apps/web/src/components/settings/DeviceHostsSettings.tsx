@@ -19,11 +19,16 @@ import { MoreVertical, PlusIcon } from "lucide-react";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import { SettingsRow } from "./settingsLayout";
 
-/** Host names and identity paths belong to the selected environment, never all environments. */
+import { useSettingsScope } from "./SettingsScopeContext";
+import { toastManager } from "../ui/toast";
+import { updateDeviceHosts } from "./deviceHostsSettings.logic";
+
 export function DeviceHostsSettings(props: {
   environmentId: EnvironmentId | null;
   hosts: ReadonlyArray<SshDeviceHostConfig>;
 }) {
+  const { scope, environments } = useSettingsScope();
+  const projectScope = scope.kind === "project" || scope.kind === "checkout";
   const update = useAtomCommand(serverEnvironment.updateSettings);
   const test = useAtomCommand(deviceEnvironment.testHost, { reportFailure: false });
   const { state } = useDeviceState(props.environmentId);
@@ -39,16 +44,41 @@ export function DeviceHostsSettings(props: {
   >({});
   const setCheck = (id: string, value: (typeof checks)[string]) =>
     setChecks((current) => ({ ...current, [id]: value }));
-  const save = async (hosts: ReadonlyArray<SshDeviceHostConfig>) => {
-    if (!props.environmentId) return;
+  const save = async (host: SshDeviceHostConfig, remove = false) => {
+    if (!props.environmentId || projectScope) return;
     setBusy(true);
     try {
-      const saved = await update({
-        environmentId: props.environmentId,
-        input: { patch: { deviceHosts: hosts } },
+      const results = await Promise.allSettled(
+        environments.map(async (environment) => {
+          if (environment.connection.phase !== "connected" || !environment.serverConfig) {
+            throw new Error("Environment disconnected");
+          }
+          return update({
+            environmentId: environment.environmentId,
+            input: {
+              patch: {
+                deviceHosts: updateDeviceHosts(
+                  environment.serverConfig.settings.deviceHosts,
+                  host,
+                  remove,
+                ),
+              },
+            },
+          });
+        }),
+      );
+      const failed = environments.filter((_, index) => {
+        const result = results[index];
+        return result?.status !== "fulfilled" || result.value._tag === "Failure";
       });
-      if (saved._tag === "Success") {
+      if (failed.length === 0) {
         setEditing(null);
+      } else {
+        toastManager.add({
+          type: "error",
+          title: "Device hosts not saved on all environments",
+          description: `Could not update ${failed.map((environment) => environment.label).join(", ")}.`,
+        });
       }
     } finally {
       setBusy(false);
@@ -73,12 +103,14 @@ export function DeviceHostsSettings(props: {
     <SettingsRow
       id="device-hosts"
       title="Device hosts"
-      description="Add remote machines with simulator or emulator runtimes installed, and this environment will connect over SSH and set up device tools automatically."
+      serverScoped
+      settingKeys={["deviceHosts"]}
+      description="Add remote machines with simulator or emulator runtimes installed, and the selected environments will connect over SSH and set up device tools automatically."
       control={
         <Button
           size="sm"
           variant="outline"
-          disabled={busy || !props.environmentId || editing !== null}
+          disabled={projectScope || busy || !props.environmentId || editing !== null}
           onClick={() => {
             setEditing({ id: randomUUID(), label: "", target: "" });
           }}
@@ -90,7 +122,7 @@ export function DeviceHostsSettings(props: {
       <div className="pt-3 pb-2">
         {!props.environmentId ? (
           <p className="text-sm text-muted-foreground">
-            Select one connected environment to manage its device hosts.
+            Connect a selected environment to manage device hosts.
           </p>
         ) : (
           <>
@@ -173,7 +205,7 @@ export function DeviceHostsSettings(props: {
                         <Button
                           size="icon-sm"
                           variant="ghost-muted"
-                          disabled={busy}
+                          disabled={projectScope || busy}
                           aria-label={host.label + " options"}
                         />
                       }
@@ -188,12 +220,7 @@ export function DeviceHostsSettings(props: {
                       >
                         Edit
                       </MenuItem>
-                      <MenuItem
-                        variant="destructive"
-                        onClick={() =>
-                          void save(props.hosts.filter((value) => value.id !== host.id))
-                        }
-                      >
+                      <MenuItem variant="destructive" onClick={() => void save(host, true)}>
                         Remove
                       </MenuItem>
                     </MenuPopup>
@@ -214,7 +241,7 @@ export function DeviceHostsSettings(props: {
                 className="space-y-3 border-t border-border/50 py-3"
                 onSubmit={(event) => {
                   event.preventDefault();
-                  void save([...props.hosts.filter((host) => host.id !== editing.id), editing]);
+                  void save(editing);
                 }}
               >
                 <label className="block space-y-1 text-sm">
@@ -222,7 +249,7 @@ export function DeviceHostsSettings(props: {
                   <Input
                     required
                     value={editing.label}
-                    disabled={busy}
+                    disabled={projectScope || busy}
                     onChange={(event) => setEditing({ ...editing, label: event.target.value })}
                     placeholder="Mac mini"
                   />
@@ -232,7 +259,7 @@ export function DeviceHostsSettings(props: {
                   <Input
                     required
                     value={editing.target}
-                    disabled={busy}
+                    disabled={projectScope || busy}
                     onChange={(event) => setEditing({ ...editing, target: event.target.value })}
                     placeholder="user@host or SSH alias"
                   />
@@ -241,7 +268,7 @@ export function DeviceHostsSettings(props: {
                   <span>Identity file, optional</span>
                   <Input
                     value={editing.identityFile ?? ""}
-                    disabled={busy}
+                    disabled={projectScope || busy}
                     onChange={(event) => {
                       const { identityFile: _, ...rest } = editing;
                       setEditing(
@@ -258,7 +285,7 @@ export function DeviceHostsSettings(props: {
                     min={1}
                     max={65535}
                     value={editing.port ?? ""}
-                    disabled={busy}
+                    disabled={projectScope || busy}
                     onChange={(event) => {
                       const { port: _, ...rest } = editing;
                       setEditing(
@@ -299,7 +326,7 @@ export function DeviceHostsSettings(props: {
                     size="sm"
                     type="button"
                     variant="ghost"
-                    disabled={busy}
+                    disabled={projectScope || busy}
                     onClick={() => {
                       setEditing(null);
                     }}
