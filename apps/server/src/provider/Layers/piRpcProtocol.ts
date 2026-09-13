@@ -12,6 +12,7 @@
  *
  * @module provider/piRpcProtocol
  */
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 /**
@@ -273,13 +274,17 @@ export const decodePiThinkingLevelChanged = Schema.decodeUnknownOption(
 );
 
 /** Blocking extension dialogs. Pi waits for an `extension_ui_response` with the
- * same `id`; fire-and-forget methods (`notify`, `setStatus`, …) need no reply. */
+ * same `id`; fire-and-forget methods (`notify`, `setStatus`, …) need no reply.
+ * `setWidget` is fire-and-forget too, but carries the pi-subagents status
+ * snapshot in `widgetLines`, so the payload fields are modelled here. */
 export const PiExtensionUiRequest = Schema.Struct({
   type: Schema.Literal("extension_ui_request"),
   id: Schema.String,
   method: Schema.String,
   title: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
+  widgetKey: Schema.optional(Schema.String),
+  widgetLines: Schema.optional(Schema.Array(Schema.String)),
 });
 export type PiExtensionUiRequest = typeof PiExtensionUiRequest.Type;
 
@@ -296,6 +301,101 @@ export const piDialogCancelledResponse = (id: string) => ({
   id,
   cancelled: true,
 });
+
+/** pi-subagents status channel. The extension pushes a whole snapshot roughly
+ * once a second while runs are live, so a consumer folds snapshots rather than
+ * accumulating events. A frame without `widgetLines` clears the widget, which
+ * happens at session start, during compaction, and at teardown — it never means
+ * "every run finished". */
+export const PI_SUBAGENT_ASYNC_WIDGET_KEY = "subagent-async";
+export const PI_SUBAGENT_ASYNC_JSON_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
+
+export const PiSubagentActivity = Schema.Struct({
+  state: Schema.optional(Schema.String),
+  currentTool: Schema.optional(Schema.String),
+  lastActivityAt: Schema.optional(Schema.Finite),
+  currentToolStartedAt: Schema.optional(Schema.Finite),
+  turnCount: Schema.optional(Schema.Finite),
+  toolCount: Schema.optional(Schema.Finite),
+});
+export type PiSubagentActivity = typeof PiSubagentActivity.Type;
+
+/** Workflow/CI gate progress. Only the fields a status line needs are modelled;
+ * the rest of the host-step payload is dropped by the decoder. */
+export const PiSubagentHostStep = Schema.Struct({
+  kind: Schema.optional(Schema.String),
+  state: Schema.optional(Schema.String),
+  verdict: Schema.optional(Schema.String),
+  reasonCode: Schema.optional(Schema.String),
+  detail: Schema.optional(Schema.String),
+  target: Schema.optional(Schema.String),
+});
+export type PiSubagentHostStep = typeof PiSubagentHostStep.Type;
+
+/** One node of the snapshot tree: a run, a workflow, or one of their steps.
+ * `children` decodes lazily via `piSubagentChildNodes`: a self-referential
+ * schema annotation would widen `DecodingServices` and poison the Effect
+ * error channel (see `ProviderDriver.ts` on `Schema.Codec` vs `Schema`). */
+export const PiSubagentNode = Schema.Struct({
+  id: Schema.String,
+  kind: Schema.String,
+  label: Schema.String,
+  state: Schema.String,
+  startedAt: Schema.optional(Schema.Finite),
+  updatedAt: Schema.optional(Schema.Finite),
+  endedAt: Schema.optional(Schema.Finite),
+  activity: Schema.optional(PiSubagentActivity),
+  hostStep: Schema.optional(PiSubagentHostStep),
+  children: Schema.optional(Schema.Array(Schema.Unknown)),
+});
+export type PiSubagentNode = typeof PiSubagentNode.Type;
+
+/** Decodes one node nested under another, dropping anything unreadable instead
+ * of failing the whole snapshot. */
+export const piSubagentChildNodes = (
+  node: Pick<PiSubagentNode, "children">,
+): ReadonlyArray<PiSubagentNode> =>
+  (node.children ?? []).flatMap((child) => {
+    const decoded = Schema.decodeUnknownOption(PiSubagentNode)(child);
+    return Option.isSome(decoded) ? [decoded.value] : [];
+  });
+
+export const PiSubagentSnapshot = Schema.Struct({
+  kind: Schema.Literal("pi-subagents.async-status-snapshot"),
+  version: Schema.Literal(1),
+  generatedAt: Schema.optional(Schema.Finite),
+  omitted: Schema.optional(
+    Schema.Struct({
+      runs: Schema.optional(Schema.Finite),
+      children: Schema.optional(Schema.Finite),
+      byteLimitExceeded: Schema.optional(Schema.Boolean),
+    }),
+  ),
+  runs: Schema.Array(PiSubagentNode),
+});
+export type PiSubagentSnapshot = typeof PiSubagentSnapshot.Type;
+
+/**
+ * Decodes one `PI_SUBAGENT_ASYNC_JSON:` widget line. A line from another
+ * extension, malformed JSON, or a payload this build does not model is ignored:
+ * a status banner must never fail the session.
+ */
+export const decodePiSubagentSnapshot = (line: string): Option.Option<PiSubagentSnapshot> => {
+  if (!line.startsWith(PI_SUBAGENT_ASYNC_JSON_PREFIX)) return Option.none();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line.slice(PI_SUBAGENT_ASYNC_JSON_PREFIX.length));
+  } catch {
+    return Option.none();
+  }
+  return Schema.decodeUnknownOption(PiSubagentSnapshot)(parsed);
+};
+
+/** The snapshot widget's first `PI_SUBAGENT_ASYNC_JSON:` line, if any. */
+export const piSubagentSnapshotLine = (
+  widgetLines: ReadonlyArray<string> | undefined,
+): string | undefined =>
+  widgetLines?.find((line) => line.startsWith(PI_SUBAGENT_ASYNC_JSON_PREFIX));
 
 /** `thinkingLevelMap` entries are `null` for levels a model does not support. */
 export const supportedThinkingLevels = (

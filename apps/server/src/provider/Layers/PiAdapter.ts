@@ -13,6 +13,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeItemId,
+  RuntimeTaskId,
   TurnId,
   isToolLifecycleItemType,
   type ChatAttachment,
@@ -20,6 +21,7 @@ import {
   type ProviderEvent,
   type ProviderRuntimeEvent,
   type ProviderTurnStartResult,
+  type RuntimeTaskStatus,
   type ThreadId,
   type ToolLifecycleItemType,
 } from "@t3tools/contracts";
@@ -127,6 +129,50 @@ const toolItemType = (candidate: unknown): ToolLifecycleItemType =>
   typeof candidate === "string" && isToolLifecycleItemType(candidate)
     ? candidate
     : "dynamic_tool_call";
+
+const piTaskText = (value: unknown): string | undefined =>
+  typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+
+const piTaskId = (payload: Readonly<Record<string, unknown>>): RuntimeTaskId | undefined => {
+  const taskId = piTaskText(payload.taskId);
+  return taskId !== undefined ? RuntimeTaskId.make(taskId) : undefined;
+};
+
+/** Agent-internal background work has a `taskType` in the monitor families;
+ * a Pi child is an agent, so only the shared vocabulary is passed through. */
+const piTaskStatus = (value: unknown): RuntimeTaskStatus | undefined => {
+  switch (value) {
+    case "pending":
+    case "running":
+    case "waiting":
+    case "idle":
+    case "completed":
+    case "failed":
+    case "cancelled":
+    case "interrupted":
+      return value;
+    default:
+      return undefined;
+  }
+};
+
+/** Completion is the narrow set; the runtime only ever emits these three, and a
+ * value outside it is dropped rather than invented into a terminal state. */
+const piTaskCompletion = (value: unknown): "completed" | "failed" | "stopped" | undefined =>
+  value === "completed" || value === "failed" || value === "stopped" ? value : undefined;
+
+/** Identity linkage the runtime repeats on every subagent row, so a client fold
+ * can rebuild a row whose start has aged out of activity retention. */
+const piTaskLinkage = (
+  payload: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, string>> => {
+  const linkage: Record<string, string> = {};
+  for (const key of ["title", "toolUseId", "parentAgentId", "model"] as const) {
+    const value = piTaskText(payload[key]);
+    if (value !== undefined) linkage[key] = value;
+  }
+  return linkage;
+};
 
 /** Pi reads its thinking level from a per-model option; T3 stores it as the
  * `thinkingLevel` selection the model picker publishes. */
@@ -309,6 +355,85 @@ export const mapPiEventToRuntimeEvents = (
           ...base,
           type: "turn.aborted",
           payload: { reason: payload.reason ?? "Interrupted by user." },
+        },
+      ];
+    }
+    case "task/started": {
+      const payload = (event.payload ?? {}) as Readonly<Record<string, unknown>>;
+      const taskId = piTaskId(payload);
+      if (taskId === undefined) return [];
+      const description = piTaskText(payload.description);
+      return [
+        {
+          ...base,
+          type: "task.started",
+          payload: {
+            taskId,
+            ...(description !== undefined ? { description } : {}),
+            ...piTaskLinkage(payload),
+          },
+        },
+      ];
+    }
+    case "task/progress": {
+      const payload = (event.payload ?? {}) as Readonly<Record<string, unknown>>;
+      const taskId = piTaskId(payload);
+      if (taskId === undefined) return [];
+      // `task.progress` rejects a blank description, so the link is kept even
+      // when the runtime's status line is missing.
+      const description =
+        piTaskText(payload.description) ?? piTaskText(payload.title) ?? "Subagent update";
+      const status = piTaskStatus(payload.status);
+      const lastToolName = piTaskText(payload.lastToolName);
+      return [
+        {
+          ...base,
+          type: "task.progress",
+          payload: {
+            taskId,
+            description,
+            ...(status !== undefined ? { status } : {}),
+            ...(lastToolName !== undefined ? { lastToolName } : {}),
+            ...piTaskLinkage(payload),
+          },
+        },
+      ];
+    }
+    case "task/updated": {
+      const payload = (event.payload ?? {}) as Readonly<Record<string, unknown>>;
+      const taskId = piTaskId(payload);
+      if (taskId === undefined) return [];
+      const status = piTaskStatus(payload.status);
+      const description = piTaskText(payload.description);
+      return [
+        {
+          ...base,
+          type: "task.updated",
+          payload: {
+            taskId,
+            ...(status !== undefined ? { status } : {}),
+            ...(description !== undefined ? { description } : {}),
+            ...piTaskLinkage(payload),
+          },
+        },
+      ];
+    }
+    case "task/completed": {
+      const payload = (event.payload ?? {}) as Readonly<Record<string, unknown>>;
+      const taskId = piTaskId(payload);
+      const status = piTaskCompletion(payload.status);
+      if (taskId === undefined || status === undefined) return [];
+      const summary = piTaskText(payload.summary);
+      return [
+        {
+          ...base,
+          type: "task.completed",
+          payload: {
+            taskId,
+            status,
+            ...(summary !== undefined ? { summary } : {}),
+            ...piTaskLinkage(payload),
+          },
         },
       ];
     }

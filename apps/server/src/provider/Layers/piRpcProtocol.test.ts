@@ -5,15 +5,20 @@ import * as NodeFS from "node:fs";
 import {
   assistantTextFromMessage,
   decodePiSessionState,
+  decodePiSubagentSnapshot,
   decodePiToolExecutionEnd,
   isPiDialogMethod,
   parsePiFrame,
+  PI_SUBAGENT_ASYNC_JSON_PREFIX,
   piModelSlug,
   piDialogCancelledResponse,
+  piSubagentChildNodes,
+  piSubagentSnapshotLine,
   splitPiModelSlug,
   splitPiLines,
   supportedThinkingLevels,
 } from "./piRpcProtocol.ts";
+import * as Option from "effect/Option";
 import { describe, it } from "@effect/vitest";
 
 const golden = (name: string): string =>
@@ -142,5 +147,76 @@ describe("piRpcProtocol", () => {
     );
     NodeAssert.equal(assistantTextFromMessage({ role: "assistant", content: [] }), undefined);
     NodeAssert.equal(assistantTextFromMessage("not a message"), undefined);
+  });
+
+  it("decodes the pi-subagents status snapshot out of the widget lines", () => {
+    // Captured from a real run: a run with one step child, mid-flight.
+    const line = `${PI_SUBAGENT_ASYNC_JSON_PREFIX}${JSON.stringify({
+      kind: "pi-subagents.async-status-snapshot",
+      version: 1,
+      generatedAt: 1789315557314,
+      caps: { maxRuns: 20, maxChildrenPerNode: 8, maxDepth: 3 },
+      omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+      runs: [
+        {
+          id: "1fa67559-55fd-41e2-9fa2-4d7dc7852ed0",
+          kind: "subagent",
+          label: "scout",
+          state: "running",
+          startedAt: 1789315499035,
+          activity: { currentTool: "bash", turnCount: 1, toolCount: 1 },
+          children: [{ id: "step:0", kind: "step", label: "scout", state: "running" }],
+        },
+      ],
+    })}`;
+    const decoded = decodePiSubagentSnapshot(line);
+    NodeAssert.ok(Option.isSome(decoded));
+    const snapshot = Option.getOrThrow(decoded);
+    NodeAssert.equal(snapshot.runs.length, 1);
+    NodeAssert.equal(snapshot.omitted?.byteLimitExceeded, false);
+    NodeAssert.equal(snapshot.runs[0]?.state, "running");
+    NodeAssert.equal(snapshot.runs[0]?.activity?.currentTool, "bash");
+
+    // Children decode lazily, and an unreadable child is dropped, not fatal.
+    const children = piSubagentChildNodes(snapshot.runs[0] ?? { children: undefined });
+    NodeAssert.equal(children.length, 1);
+    NodeAssert.equal(children[0]?.id, "step:0");
+    NodeAssert.deepEqual(piSubagentChildNodes({ children: ["not a node", { id: 1 }] }), []);
+  });
+
+  it("ignores status payloads it cannot read instead of failing the session", () => {
+    // Malformed JSON, another extension's widget, and a future snapshot version.
+    NodeAssert.equal(
+      decodePiSubagentSnapshot("PI_SUBAGENT_ASYNC_JSON:{oops").pipe(Option.isNone),
+      true,
+    );
+    NodeAssert.equal(
+      decodePiSubagentSnapshot('SOME_OTHER_EXTENSION:{"runs":[]}').pipe(Option.isNone),
+      true,
+    );
+    NodeAssert.equal(
+      decodePiSubagentSnapshot(
+        `${PI_SUBAGENT_ASYNC_JSON_PREFIX}${JSON.stringify({
+          kind: "pi-subagents.async-status-snapshot",
+          version: 2,
+          runs: [],
+        })}`,
+      ).pipe(Option.isNone),
+      true,
+    );
+    // A snapshot with no runs is valid, and means "nothing to show right now".
+    const empty = decodePiSubagentSnapshot(
+      `${PI_SUBAGENT_ASYNC_JSON_PREFIX}${JSON.stringify({
+        kind: "pi-subagents.async-status-snapshot",
+        version: 1,
+        runs: [],
+      })}`,
+    );
+    NodeAssert.ok(Option.isSome(empty));
+    NodeAssert.deepEqual(Option.getOrThrow(empty).runs, []);
+
+    // A lineless setWidget clears the widget: no snapshot line to read.
+    NodeAssert.equal(piSubagentSnapshotLine(undefined), undefined);
+    NodeAssert.equal(piSubagentSnapshotLine(["other:text"]), undefined);
   });
 });

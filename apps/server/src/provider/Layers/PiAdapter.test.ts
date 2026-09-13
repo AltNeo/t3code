@@ -203,6 +203,112 @@ const unwrap = (
   return Option.getOrThrow(result);
 };
 
+it("maps subagent rows onto T3 task events", () => {
+  const turnId = TurnId.make("turn-9");
+  const linkage = {
+    taskId: "1fa67559-55fd-41e2-9fa2-4d7dc7852ed0",
+    title: "scout",
+    toolUseId: "call-bg-1",
+    model: "openai-codex/gpt-5.6-luna:high",
+  };
+
+  const started = mapPiEventToRuntimeEvents(
+    piEvent({ method: "task/started", turnId, payload: { ...linkage, description: "Queued" } }),
+  );
+  NodeAssert.equal(started[0]?.type, "task.started");
+  NodeAssert.equal(started[0]?.turnId, turnId);
+  NodeAssert.deepEqual(started[0]?.payload, {
+    taskId: "1fa67559-55fd-41e2-9fa2-4d7dc7852ed0",
+    description: "Queued",
+    title: "scout",
+    toolUseId: "call-bg-1",
+    model: "openai-codex/gpt-5.6-luna:high",
+  });
+  // No agentId and no taskType: that absence is what classifies the run as an
+  // agent (the agents panel) instead of background work (the work log).
+  NodeAssert.equal("agentId" in (started[0]?.payload ?? {}), false);
+  NodeAssert.equal("taskType" in (started[0]?.payload ?? {}), false);
+
+  const progress = mapPiEventToRuntimeEvents(
+    piEvent({
+      method: "task/progress",
+      turnId,
+      payload: {
+        taskId: linkage.taskId,
+        description: "Running bash",
+        status: "running",
+        lastToolName: "bash",
+        title: "scout",
+      },
+    }),
+  );
+  NodeAssert.equal(progress[0]?.type, "task.progress");
+  NodeAssert.deepEqual(progress[0]?.payload, {
+    taskId: linkage.taskId,
+    description: "Running bash",
+    status: "running",
+    lastToolName: "bash",
+    title: "scout",
+  });
+
+  // `task.progress` rejects a blank description, so the row keeps a usable line.
+  const blank = mapPiEventToRuntimeEvents(
+    piEvent({ method: "task/progress", payload: { taskId: linkage.taskId, description: "  " } }),
+  );
+  NodeAssert.equal(
+    (blank[0]?.payload as { readonly description?: string }).description,
+    "Subagent update",
+  );
+  // A row without an id is not actionable and is dropped.
+  NodeAssert.deepEqual(
+    mapPiEventToRuntimeEvents(piEvent({ method: "task/progress", payload: { description: "x" } })),
+    [],
+  );
+
+  const updated = mapPiEventToRuntimeEvents(
+    piEvent({
+      method: "task/updated",
+      payload: { taskId: linkage.taskId, status: "waiting", description: "Needs attention" },
+    }),
+  );
+  NodeAssert.equal(updated[0]?.type, "task.updated");
+  NodeAssert.deepEqual(updated[0]?.payload, {
+    taskId: linkage.taskId,
+    status: "waiting",
+    description: "Needs attention",
+  });
+
+  const completed = mapPiEventToRuntimeEvents(
+    piEvent({
+      method: "task/completed",
+      payload: {
+        taskId: linkage.taskId,
+        status: "stopped",
+        summary: "Stopped when the session closed.",
+        toolUseId: "call-bg-1",
+      },
+    }),
+  );
+  NodeAssert.equal(completed[0]?.type, "task.completed");
+  NodeAssert.deepEqual(completed[0]?.payload, {
+    taskId: linkage.taskId,
+    status: "stopped",
+    summary: "Stopped when the session closed.",
+    toolUseId: "call-bg-1",
+  });
+  // Completion status is the closed set; anything else is dropped rather than
+  // invented into a terminal outcome.
+  NodeAssert.deepEqual(
+    mapPiEventToRuntimeEvents(
+      piEvent({
+        method: "task/completed",
+        payload: { taskId: linkage.taskId, status: "cancelled" },
+      }),
+    ),
+    [],
+  );
+});
+
 it("maps Pi runtime events onto T3 runtime events", () => {
   const turnId = TurnId.make("turn-9");
   const delta = mapPiEventToRuntimeEvents(

@@ -24,6 +24,7 @@ import {
   type ProviderSession,
   type ProviderInstanceId,
   type RuntimeMode,
+  type RuntimeTaskStatus,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
@@ -55,18 +56,24 @@ import {
   decodePiMessages,
   decodePiSessionInfoChanged,
   decodePiSessionState,
+  decodePiSubagentSnapshot,
   decodePiThinkingLevelChanged,
   decodePiToolExecutionEnd,
   decodePiToolExecutionStart,
   decodePiToolExecutionUpdate,
   decodePiTurnEnd,
   isPiDialogMethod,
+  PI_SUBAGENT_ASYNC_WIDGET_KEY,
   piDialogCancelledResponse,
   piModelSlug,
+  piSubagentChildNodes,
+  piSubagentSnapshotLine,
   splitPiModelSlug,
   type PiFrame,
   type PiResponse,
   type PiSessionState,
+  type PiSubagentNode,
+  type PiSubagentSnapshot,
 } from "./piRpcProtocol.ts";
 
 /** Pi's own session identity, persisted by T3 and replayed on resume. */
@@ -283,6 +290,249 @@ const PI_UNKNOWN_EVENT_LIMIT = 20;
 const PLACEHOLDER_MODEL_ID = "unknown";
 const PROVIDER = ProviderDriverKind.make("pi");
 
+/** Pi tool names that spawn pi-subagents children. */
+const PI_SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "subagent",
+  "task",
+  "subagent_supervisor",
+]);
+const PI_SUBAGENT_TITLE_LIMIT = 120;
+const PI_SUBAGENT_DESCRIPTION_LIMIT = 200;
+
+const isPiSubagentTool = (toolName: string): boolean => PI_SUBAGENT_TOOL_NAMES.has(toolName);
+
+/**
+ * Snapshot state → T3's wide status vocabulary. An unrecognised state maps to
+ * `running` on purpose: a newer Pi that adds a state must not have a live run
+ * reported as finished.
+ */
+export const piTaskStatusForState = (state: string): RuntimeTaskStatus => {
+  switch (state) {
+    case "queued":
+      return "pending";
+    case "paused":
+      return "waiting";
+    case "idle":
+      return "idle";
+    case "complete":
+      return "completed";
+    case "stopped":
+      // The wide vocabulary has no "stopped": that value exists only on
+      // `task.completed`, which `piTaskCompletionForState` feeds.
+      return "cancelled";
+    case "failed":
+    case "partial":
+    case "rejected":
+      return "failed";
+    default:
+      return "running";
+  }
+};
+
+/** Terminal mapping for `task.completed`, whose status is the narrow set
+ * `completed | failed | stopped`. `undefined` means the run is still live. */
+export const piTaskCompletionForState = (
+  state: string,
+): "completed" | "failed" | "stopped" | undefined => {
+  switch (state) {
+    case "complete":
+      return "completed";
+    case "stopped":
+      return "stopped";
+    case "failed":
+    case "partial":
+    case "rejected":
+      return "failed";
+    default:
+      return undefined;
+  }
+};
+
+const boundedText = (value: string, limit: number): string =>
+  value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+
+/**
+ * Human status line for one snapshot node. Never empty: a blank description is
+ * rejected by `task.progress`, and the agents panel renders this text as-is.
+ */
+export const piSubagentDescription = (node: PiSubagentNode): string => {
+  const hostDetail = node.hostStep?.detail?.trim();
+  if (hostDetail !== undefined && hostDetail.length > 0) {
+    return boundedText(hostDetail, PI_SUBAGENT_DESCRIPTION_LIMIT);
+  }
+  if (node.activity?.state === "needs_attention") return "Needs attention";
+  const tool = node.activity?.currentTool?.trim();
+  const prefix = tool !== undefined && tool.length > 0 ? `Running ${tool}` : "Running";
+  switch (node.state) {
+    case "queued":
+      return "Queued";
+    case "paused":
+      return "Paused";
+    case "idle":
+      return "Idle";
+    case "complete":
+      return "Completed";
+    case "stopped":
+      return "Stopped";
+    case "failed":
+      return "Failed";
+    case "partial":
+      return "One or more child runs failed";
+    case "rejected":
+      return "Rejected";
+    default:
+      return prefix;
+  }
+};
+
+/**
+ * Flattens the snapshot tree into the nodes that are runs. `step` and
+ * `host-step` nodes are phases *inside* a run — the run node already repeats
+ * their label and state, so emitting them as rows too would double every
+ * single-child run. Steps that belong to a nested run still group under it.
+ */
+export const collectPiSubagentRuns = (
+  nodes: ReadonlyArray<PiSubagentNode>,
+  parentAgentId: string | undefined,
+): ReadonlyArray<{ readonly node: PiSubagentNode; readonly parentAgentId?: string }> => {
+  const collected: Array<{ readonly node: PiSubagentNode; readonly parentAgentId?: string }> = [];
+  for (const node of nodes) {
+    if (node.kind !== "subagent" && node.kind !== "workflow") {
+      collected.push(...collectPiSubagentRuns(piSubagentChildNodes(node), parentAgentId));
+      continue;
+    }
+    collected.push({ node, ...(parentAgentId !== undefined ? { parentAgentId } : {}) });
+    collected.push(...collectPiSubagentRuns(piSubagentChildNodes(node), node.id));
+  }
+  return collected;
+};
+
+/** The agent name Pi puts on a `subagent` call, falling back to the tool name. */
+const piSubagentCallLabel = (args: unknown, toolName: string): string => {
+  if (typeof args !== "object" || args === null) return toolName;
+  const agent = (args as { readonly agent?: unknown }).agent;
+  return typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : toolName;
+};
+
+/** `async: false` runs the child inside the parent tool call and dies with it;
+ * anything else detaches the child to a background runner. */
+const piToolCallIsForeground = (args: unknown): boolean =>
+  typeof args === "object" &&
+  args !== null &&
+  (args as { readonly async?: unknown }).async === false;
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Last non-empty string of a bounded tail array (`recentOutput`, `recentTools`). */
+const lastNonEmptyText = (value: unknown): string | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  for (let index = value.length - 1; index >= 0; index -= 1) {
+    const candidate = value[index];
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+  }
+  return undefined;
+};
+
+interface PiForegroundSubagentProgress {
+  readonly description: string;
+  readonly fingerprint: string;
+  readonly lastToolName?: string;
+  readonly model?: string;
+}
+
+/**
+ * Progress of a foreground child, read from `tool_execution_update`. Pi streams
+ * the accumulated child result there (`partialResult.details.progress[0]`); no
+ * snapshot frames exist for these runs.
+ */
+const piForegroundSubagentProgress = (
+  partialResult: unknown,
+): PiForegroundSubagentProgress | undefined => {
+  if (!isRecord(partialResult) || !isRecord(partialResult.details)) return undefined;
+  const entries = partialResult.details.progress;
+  const first = Array.isArray(entries) ? entries[0] : undefined;
+  if (!isRecord(first)) return undefined;
+  const status = typeof first.status === "string" ? first.status : "running";
+  const output = lastNonEmptyText(first.recentOutput);
+  const tool = lastNonEmptyText(first.recentTools);
+  const description =
+    output ??
+    (tool !== undefined ? `Running ${tool}` : status === "completed" ? "Completed" : "Running");
+  const model =
+    typeof first.model === "string" && first.model.trim().length > 0
+      ? first.model.trim()
+      : undefined;
+  return {
+    description: boundedText(description, PI_SUBAGENT_DESCRIPTION_LIMIT),
+    fingerprint: `${status}|${tool ?? ""}|${output ?? ""}`,
+    ...(tool !== undefined ? { lastToolName: tool } : {}),
+    ...(model !== undefined ? { model } : {}),
+  };
+};
+
+/**
+ * Verdict for a finished foreground child. `exitCode` decides when Pi reported
+ * one; `isError` is the fallback for a call that failed before producing a
+ * result. The child's own final output becomes the row's summary.
+ */
+const piForegroundSubagentCompletion = (
+  result: unknown,
+  isError: boolean,
+): {
+  readonly status: "completed" | "failed";
+  readonly summary?: string;
+  readonly model?: string;
+} => {
+  const first =
+    isRecord(result) && isRecord(result.details) && Array.isArray(result.details.results)
+      ? result.details.results[0]
+      : undefined;
+  if (!isRecord(first)) return { status: isError ? "failed" : "completed" };
+  const exitCode = typeof first.exitCode === "number" ? first.exitCode : undefined;
+  const finalOutput =
+    typeof first.finalOutput === "string" && first.finalOutput.trim().length > 0
+      ? first.finalOutput.trim()
+      : undefined;
+  const model =
+    typeof first.model === "string" && first.model.trim().length > 0
+      ? first.model.trim()
+      : undefined;
+  return {
+    status: isError || (exitCode !== undefined && exitCode !== 0) ? "failed" : "completed",
+    ...(finalOutput !== undefined
+      ? { summary: boundedText(finalOutput, PI_SUBAGENT_DESCRIPTION_LIMIT) }
+      : {}),
+    ...(model !== undefined ? { model } : {}),
+  };
+};
+
+/** Run id of a `subagent` tool result Pi detached to a background runner. */
+const piSubagentToolResultRunId = (result: unknown): string | undefined => {
+  if (!isRecord(result) || !isRecord(result.details)) return undefined;
+  const details = result.details;
+  for (const key of ["asyncId", "runId"] as const) {
+    const candidate = details[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+  }
+  return undefined;
+};
+
+/** One subagent row, reconciled from snapshots (background runs) or from the
+ * spawning tool call (foreground runs). */
+interface PiTrackedSubagentRun {
+  readonly taskId: string;
+  readonly foreground: boolean;
+  readonly parentAgentId?: string;
+  readonly title: string;
+  description: string;
+  status: RuntimeTaskStatus;
+  fingerprint: string;
+  toolUseId?: string;
+  model?: string;
+  live: boolean;
+}
+
 export const makePiSessionRuntime = (
   options: PiSessionRuntimeOptions,
 ): Effect.Effect<
@@ -390,6 +640,275 @@ export const makePiSessionRuntime = (
         method,
         message,
         ...(payload !== undefined ? { payload } : {}),
+      });
+
+    // --- Subagent trail -------------------------------------------------
+    // pi-subagents mirrors its run status through `setWidget` snapshots, and
+    // T3's agents panel renders `task.*` activities. This block is the bridge:
+    // it tracks runs, folds each snapshot, and emits the task lifecycle.
+    //
+    // Frames arrive on one sequential stream fiber, so plain maps are safe here.
+    const subagentRuns = new Map<string, PiTrackedSubagentRun>();
+    /** Launch labels of `subagent` tool calls that have not returned yet. */
+    const openSubagentCalls = new Map<string, string>();
+    /** Run id → tool call id, learned when the call returns after the run was
+     * first seen in a snapshot. */
+    const lateBoundToolUseIds = new Map<string, string>();
+    const omittedSubagentsWarnedRef = yield* Ref.make(false);
+
+    const emitTaskEvent = (
+      method: "task/started" | "task/progress" | "task/updated" | "task/completed",
+      payload: Readonly<Record<string, unknown>>,
+      turnId: TurnId | undefined,
+    ) =>
+      emitEvent({
+        kind: "notification",
+        threadId: options.threadId,
+        method,
+        ...(turnId !== undefined ? { turnId } : {}),
+        payload,
+      });
+
+    /** Turn attribution only while the spawning turn is still running: a
+     * detached child outlives its turn, and its completion must not be filed
+     * under a turn the user already finished. */
+    const subagentTurnId = Effect.gen(function* () {
+      const turn = yield* Ref.get(activeTurnRef);
+      return turn !== undefined && !turn.settled ? turn.turnId : undefined;
+    });
+
+    /** Identity linkage, repeated on every row so the client fold can rebuild a
+     * row whose start has aged out of retention. `agentId` stays unset: that is
+     * what classifies a run as an agent instead of background work. */
+    const subagentLinkage = (run: PiTrackedSubagentRun): Readonly<Record<string, unknown>> => ({
+      taskId: run.taskId,
+      title: run.title,
+      ...(run.toolUseId !== undefined ? { toolUseId: run.toolUseId } : {}),
+      ...(run.parentAgentId !== undefined ? { parentAgentId: run.parentAgentId } : {}),
+      ...(run.model !== undefined ? { model: run.model } : {}),
+    });
+
+    const labelMatches = (callLabel: string, runLabel: string): boolean => {
+      const call = callLabel.trim().toLowerCase();
+      if (call.length === 0) return false;
+      return runLabel
+        .split(",")
+        .map((part) => part.trim().toLowerCase())
+        .includes(call);
+    };
+
+    /** A background run appears in the status snapshot before its tool call
+     * returns, so the first sighting can only link by launch label. */
+    const bindSubagentToolUse = (runId: string, label: string): string | undefined => {
+      const late = lateBoundToolUseIds.get(runId);
+      if (late !== undefined) return late;
+      const candidates = [...openSubagentCalls.entries()].filter(([, callLabel]) =>
+        labelMatches(callLabel, label),
+      );
+      return candidates.length === 1 ? candidates[0]?.[0] : undefined;
+    };
+
+    const applySubagentSnapshot = (snapshot: PiSubagentSnapshot) =>
+      Effect.gen(function* () {
+        const omittedRuns = snapshot.omitted?.runs ?? 0;
+        if (omittedRuns > 0 || snapshot.omitted?.byteLimitExceeded === true) {
+          // One warning per session: the snapshot repeats ~once a second.
+          const warned = yield* Ref.getAndSet(omittedSubagentsWarnedRef, true);
+          if (!warned) {
+            yield* emitWarning(
+              "runtime/warning",
+              omittedRuns > 0
+                ? `${omittedRuns} subagent run(s) are missing from Pi's status snapshot, so this thread's agent list is incomplete.`
+                : "Pi truncated its subagent status snapshot, so this thread's agent list is incomplete.",
+            );
+          }
+        }
+        const turnId = yield* subagentTurnId;
+        yield* Effect.forEach(
+          collectPiSubagentRuns(snapshot.runs, undefined),
+          (entry) => reconcileSubagentRun(entry, turnId),
+          { discard: true },
+        );
+      });
+
+    const reconcileSubagentRun = (
+      entry: { readonly node: PiSubagentNode; readonly parentAgentId?: string },
+      turnId: TurnId | undefined,
+    ) =>
+      Effect.gen(function* () {
+        const node = entry.node;
+        const completion = piTaskCompletionForState(node.state);
+        const attention = node.activity?.state === "needs_attention";
+        const status: RuntimeTaskStatus = attention ? "waiting" : piTaskStatusForState(node.state);
+        const description = piSubagentDescription(node);
+        const fingerprint = `${node.state}|${node.activity?.currentTool ?? ""}|${attention ? "attention" : ""}|${node.hostStep?.state ?? ""}`;
+        const existing = subagentRuns.get(node.id);
+
+        if (existing === undefined) {
+          const toolUseId = bindSubagentToolUse(node.id, node.label);
+          const run: PiTrackedSubagentRun = {
+            taskId: node.id,
+            foreground: false,
+            ...(entry.parentAgentId !== undefined ? { parentAgentId: entry.parentAgentId } : {}),
+            title: boundedText(node.label, PI_SUBAGENT_TITLE_LIMIT),
+            description,
+            status,
+            fingerprint,
+            ...(toolUseId !== undefined ? { toolUseId } : {}),
+            live: completion === undefined,
+          };
+          subagentRuns.set(node.id, run);
+          yield* emitTaskEvent("task/started", { ...subagentLinkage(run), description }, turnId);
+          if (completion !== undefined) {
+            yield* emitTaskEvent(
+              "task/completed",
+              { ...subagentLinkage(run), status: completion, summary: description },
+              turnId,
+            );
+          }
+          return;
+        }
+
+        if (!existing.live) return;
+        // The launch call can return after the run's first snapshot, so the
+        // link to its tool row is learned late and published on the next row.
+        const toolUseId = existing.toolUseId ?? bindSubagentToolUse(node.id, node.label);
+        const learnedToolUse = existing.toolUseId === undefined && toolUseId !== undefined;
+        if (learnedToolUse) existing.toolUseId = toolUseId;
+        existing.description = description;
+        existing.status = status;
+
+        if (completion !== undefined) {
+          existing.live = false;
+          existing.fingerprint = fingerprint;
+          yield* emitTaskEvent(
+            "task/completed",
+            { ...subagentLinkage(existing), status: completion, summary: description },
+            turnId,
+          );
+          return;
+        }
+
+        const changed = existing.fingerprint !== fingerprint;
+        existing.fingerprint = fingerprint;
+        if (!changed && !learnedToolUse) return;
+        if (status === "waiting" || status === "idle") {
+          // Not running work: the panel shows a resting row, and the sidebar
+          // liveness pill must not count it.
+          yield* emitTaskEvent(
+            "task/updated",
+            { ...subagentLinkage(existing), status, description },
+            turnId,
+          );
+          return;
+        }
+        const currentTool = node.activity?.currentTool;
+        yield* emitTaskEvent(
+          "task/progress",
+          {
+            ...subagentLinkage(existing),
+            description,
+            status,
+            ...(currentTool !== undefined && currentTool.length > 0
+              ? { lastToolName: currentTool }
+              : {}),
+          },
+          turnId,
+        );
+      });
+
+    /** A foreground child runs inside its tool call, so its row is driven by the
+     * call itself: no snapshot frame is ever emitted for it. */
+    const startForegroundSubagent = (toolCallId: string, label: string, turnId: TurnId) =>
+      Effect.gen(function* () {
+        const run: PiTrackedSubagentRun = {
+          taskId: toolCallId,
+          foreground: true,
+          title: boundedText(label, PI_SUBAGENT_TITLE_LIMIT),
+          description: "Running",
+          status: "running",
+          fingerprint: "running||",
+          toolUseId: toolCallId,
+          live: true,
+        };
+        subagentRuns.set(toolCallId, run);
+        yield* emitTaskEvent(
+          "task/started",
+          { ...subagentLinkage(run), description: run.description },
+          turnId,
+        );
+      });
+
+    const updateForegroundSubagent = (toolCallId: string, turnId: TurnId, partialResult: unknown) =>
+      Effect.gen(function* () {
+        const run = subagentRuns.get(toolCallId);
+        if (run === undefined || !run.live) return;
+        const progress = piForegroundSubagentProgress(partialResult);
+        if (progress === undefined) return;
+        const learnedModel = run.model === undefined && progress.model !== undefined;
+        if (progress.model !== undefined) run.model = progress.model;
+        const changed = run.fingerprint !== progress.fingerprint;
+        if (!changed && !learnedModel) return;
+        run.fingerprint = progress.fingerprint;
+        run.description = progress.description;
+        run.status = "running";
+        yield* emitTaskEvent(
+          "task/progress",
+          {
+            ...subagentLinkage(run),
+            description: progress.description,
+            status: "running",
+            ...(progress.lastToolName !== undefined ? { lastToolName: progress.lastToolName } : {}),
+          },
+          turnId,
+        );
+      });
+
+    const completeForegroundSubagent = (
+      toolCallId: string,
+      turnId: TurnId | undefined,
+      result: unknown,
+      isError: boolean,
+    ) =>
+      Effect.gen(function* () {
+        const run = subagentRuns.get(toolCallId);
+        if (run === undefined || !run.live) return;
+        const completion = piForegroundSubagentCompletion(result, isError);
+        if (completion.model !== undefined) run.model = completion.model;
+        run.live = false;
+        yield* emitTaskEvent(
+          "task/completed",
+          {
+            ...subagentLinkage(run),
+            status: completion.status,
+            ...(completion.summary !== undefined ? { summary: completion.summary } : {}),
+          },
+          turnId,
+        );
+      });
+
+    /** Close live rows out as terminal. Used when the parent turn is aborted
+     * (foreground children only: a detached child keeps running) and when the
+     * session goes away. */
+    const stopSubagentRuns = (foregroundOnly: boolean, summary: string) =>
+      Effect.gen(function* () {
+        const turnId = yield* subagentTurnId;
+        const stopping = [...subagentRuns.values()].filter(
+          (run) => run.live && (!foregroundOnly || run.foreground),
+        );
+        yield* Effect.forEach(
+          stopping,
+          (run) =>
+            Effect.gen(function* () {
+              run.live = false;
+              yield* emitTaskEvent(
+                "task/completed",
+                { ...subagentLinkage(run), status: "stopped", summary },
+                turnId,
+              );
+            }),
+          { discard: true },
+        );
       });
 
     const mapTransportError = (error: PiRpcError): PiSessionRuntimeError => {
@@ -568,6 +1087,12 @@ export const makePiSessionRuntime = (
         const turn = yield* Ref.get(activeTurnRef);
         if (turn === undefined || turn.settled) return;
         turn.settled = true;
+        const aborted = turn.abortRequested;
+        if (aborted) {
+          // A foreground child runs inside its parent tool call, so aborting the
+          // turn kills it. A detached child keeps running, and its row stays live.
+          yield* stopSubagentRuns(true, "Stopped with the interrupted turn.");
+        }
         yield* Ref.set(activeTurnRef, undefined);
         // Read the live model back: Pi can change it natively (a `/model`
         // command, a provider fallback), and success booleans are not proof.
@@ -580,7 +1105,6 @@ export const makePiSessionRuntime = (
           activeTurnId: undefined,
           lastError: undefined,
         });
-        const aborted = turn.abortRequested;
         yield* emitEvent({
           kind: "notification",
           threadId: options.threadId,
@@ -643,6 +1167,16 @@ export const makePiSessionRuntime = (
                 ...(data !== undefined ? { data } : {}),
               },
             });
+            if (isPiSubagentTool(tool.toolName)) {
+              const label = piSubagentCallLabel(tool.args, tool.toolName);
+              if (piToolCallIsForeground(tool.args)) {
+                // A foreground child is bound to this call by construction, so it
+                // is not a binding candidate for a snapshot run.
+                yield* startForegroundSubagent(tool.toolCallId, label, activeTurn.turnId);
+              } else {
+                openSubagentCalls.set(tool.toolCallId, label);
+              }
+            }
             return;
           }
           case "tool_execution_update": {
@@ -672,6 +1206,13 @@ export const makePiSessionRuntime = (
                 data,
               },
             });
+            if (isPiSubagentTool(tool.toolName)) {
+              yield* updateForegroundSubagent(
+                tool.toolCallId,
+                activeTurn.turnId,
+                tool.partialResult,
+              );
+            }
             return;
           }
           case "tool_execution_end": {
@@ -700,6 +1241,39 @@ export const makePiSessionRuntime = (
                 data,
               },
             });
+            if (isPiSubagentTool(tool.toolName)) {
+              if (openSubagentCalls.has(tool.toolCallId)) {
+                openSubagentCalls.delete(tool.toolCallId);
+              }
+              const runId = piSubagentToolResultRunId(tool.result);
+              if (runId !== undefined) {
+                // The run was already tracked when its snapshot arrived first;
+                // otherwise remember the link for the frame that follows.
+                lateBoundToolUseIds.set(runId, tool.toolCallId);
+                const tracked = subagentRuns.get(runId);
+                if (tracked !== undefined && tracked.toolUseId === undefined && tracked.live) {
+                  tracked.toolUseId = tool.toolCallId;
+                  // Publish the link on its own row: the work log uses it to hide
+                  // the launch-tool row that this agent row replaces.
+                  const linkTurnId = yield* subagentTurnId;
+                  yield* emitTaskEvent(
+                    "task/progress",
+                    {
+                      ...subagentLinkage(tracked),
+                      description: tracked.description,
+                      status: tracked.status,
+                    },
+                    linkTurnId,
+                  );
+                }
+              }
+              yield* completeForegroundSubagent(
+                tool.toolCallId,
+                activeTurn.turnId,
+                tool.result,
+                isError,
+              );
+            }
             return;
           }
           case "turn_end": {
@@ -777,8 +1351,25 @@ export const makePiSessionRuntime = (
             const decoded = decodePiExtensionUiRequest(frame);
             if (Option.isNone(decoded)) return;
             const request = decoded.value;
+            if (
+              request.method === "setWidget" &&
+              request.widgetKey === PI_SUBAGENT_ASYNC_WIDGET_KEY
+            ) {
+              // pi-subagents republishes its whole run status here (~1/s), so the
+              // bridge folds snapshots instead of accumulating events.
+              const line = piSubagentSnapshotLine(request.widgetLines);
+              // A lineless setWidget clears the widget — at session start, during
+              // compaction, and at teardown. Pi always reports a run's terminal
+              // state in a snapshot first, so a clear never means "all finished".
+              if (line === undefined) return;
+              const snapshot = decodePiSubagentSnapshot(line);
+              if (Option.isNone(snapshot)) return;
+              yield* applySubagentSnapshot(snapshot.value);
+              return;
+            }
             if (!isPiDialogMethod(request.method)) {
-              // notify/setStatus/setWidget/... are fire-and-forget.
+              // notify/setStatus/... are fire-and-forget, and setWidget frames for
+              // other widgets are not this bridge's business.
               return;
             }
             // Milestone 1 has no dialog bridge. Answering keeps an extension
@@ -866,6 +1457,8 @@ export const makePiSessionRuntime = (
             });
           }
           yield* updateSession({ status: "error", activeTurnId: undefined });
+          // The session is gone, so nothing can report on these rows again.
+          yield* stopSubagentRuns(false, "Stopped when the Pi session exited.").pipe(Effect.ignore);
           yield* emitEvent({
             kind: "session",
             threadId: options.threadId,
@@ -1131,9 +1724,22 @@ export const makePiSessionRuntime = (
       }),
     );
 
+    /** Best-effort drain: lets the adapter's consumer take events that were
+     * emitted immediately before the queue shuts down. */
+    const drainPendingEvents = Effect.gen(function* () {
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        if ((yield* Queue.size(events)) === 0) return;
+        yield* Effect.yieldNow;
+      }
+    });
+
     const close = Effect.gen(function* () {
       const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
       if (alreadyClosed) return;
+      // Live subagent rows are closed out while the queue is still open: after
+      // `Queue.shutdown` an emitted event would never reach the consumer.
+      yield* stopSubagentRuns(false, "Stopped when the session closed.").pipe(Effect.ignore);
+      yield* drainPendingEvents;
       yield* connection.close.pipe(Effect.ignore);
       yield* Queue.shutdown(events);
     });

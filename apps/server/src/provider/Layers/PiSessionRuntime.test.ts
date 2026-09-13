@@ -24,6 +24,9 @@ import { buildPiProcessEnvironment } from "../Layers/PiProvider.ts";
 import { writeFakeCli } from "../../testUtils/fakeCli.ts";
 import {
   makePiSessionRuntime,
+  piSubagentDescription,
+  piTaskCompletionForState,
+  piTaskStatusForState,
   type PiResumeCursor,
   type PiSessionRuntimeError,
   type PiSessionRuntimeShape,
@@ -41,6 +44,23 @@ const ABORT = NodePath.join(
   NodePath.dirname(new URL(import.meta.url).pathname),
   "../testFixtures/piGoldenAbort.jsonl",
 );
+const BACKGROUND_CHILD = NodePath.join(
+  NodePath.dirname(new URL(import.meta.url).pathname),
+  "../testFixtures/piGoldenBackgroundChild.jsonl",
+);
+const BACKGROUND_CHILD_ABORT = NodePath.join(
+  NodePath.dirname(new URL(import.meta.url).pathname),
+  "../testFixtures/piGoldenBackgroundChildAbort.jsonl",
+);
+const FOREGROUND_CHILD = NodePath.join(
+  NodePath.dirname(new URL(import.meta.url).pathname),
+  "../testFixtures/piGoldenForegroundChild.jsonl",
+);
+
+/** Real ids from the captures, so a fixture swap that changes them fails loudly. */
+const BACKGROUND_RUN_ID = "1fa67559-55fd-41e2-9fa2-4d7dc7852ed0";
+const BACKGROUND_TOOL_CALL_ID = "call_00_ZfV3WtinYRvw3HNfbEfN2652";
+const FOREGROUND_TOOL_CALL_ID = "call_00_06GIgrPeeWUZDkLCTkh82312";
 
 const THREAD = ThreadId.make("thread-pi-1");
 const SESSION_ID = "01a09a71-4261-7189-9779-f4b9d29ff55c";
@@ -107,6 +127,40 @@ const compactionEnd = (
   willRetry: false,
   ...overrides,
 });
+
+const subagentRun = (
+  state: string,
+  overrides?: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> => ({
+  id: BACKGROUND_RUN_ID,
+  kind: "subagent",
+  label: "scout",
+  state,
+  ...overrides,
+});
+
+/** `setWidget` frame carrying a pi-subagents status snapshot. */
+const subagentWidget = (
+  runs: ReadonlyArray<Readonly<Record<string, unknown>>>,
+  omitted?: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> => ({
+  type: "extension_ui_request",
+  id: "widget-1",
+  method: "setWidget",
+  widgetKey: "subagent-async",
+  widgetLines: [
+    `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+      kind: "pi-subagents.async-status-snapshot",
+      version: 1,
+      generatedAt: 1,
+      ...(omitted !== undefined ? { omitted } : {}),
+      runs,
+    })}`,
+  ],
+});
+
+const payloadOf = (event: ProviderEvent): Readonly<Record<string, unknown>> =>
+  (event.payload ?? {}) as Readonly<Record<string, unknown>>;
 
 const makeFakeCli = (options: PeerOptions): PeerHarness => {
   const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-mock-"));
@@ -429,6 +483,409 @@ it.layer(NodeServices.layer)("PiSessionRuntime", (it) => {
         // Pi needs a message next to the images.
         NodeAssert.equal(promptFrames[0]?.message, "(see attached image)");
         yield* collectUntilTerminal(runtime);
+        yield* runtime.close;
+      }),
+    ),
+  );
+
+  it.effect("renders a detached pi-subagents child as an agent row that outlives its turn", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: BACKGROUND_CHILD_ABORT,
+        });
+        const runtime = yield* startRuntime(harness);
+        const started = yield* runtime.sendTurn({ text: "launch a background scout" });
+        const events = yield* collectUntil(
+          runtime,
+          (event) => event.method === "task/completed",
+          2000,
+        );
+        const taskEvents = events.filter((event) => event.method.startsWith("task/"));
+        const startedEvent = taskEvents.find((event) => event.method === "task/started");
+        NodeAssert.ok(startedEvent, "expected a task.started for the detached child");
+        NodeAssert.equal(payloadOf(startedEvent).taskId, BACKGROUND_RUN_ID);
+        NodeAssert.equal(payloadOf(startedEvent).title, "scout");
+        // No agentId: that is what puts the row on the agents surface instead of
+        // classifying it as background work.
+        NodeAssert.equal(payloadOf(startedEvent).agentId, undefined);
+        NodeAssert.equal(startedEvent.turnId, started.turnId);
+
+        const progress = taskEvents.filter((event) => event.method === "task/progress");
+        NodeAssert.ok(progress.length >= 1, "expected at least one progress tick");
+        // This capture carries 81 snapshot frames (a ~1/s heartbeat through a
+        // 60s child). The bridge folds them, so progress is reported on material
+        // change only — a per-frame emit would put dozens of rows on the panel.
+        NodeAssert.ok(
+          progress.length <= 4,
+          `expected a folded status stream, got ${progress.length} progress rows`,
+        );
+        for (const event of progress) {
+          NodeAssert.ok(
+            String(payloadOf(event).description ?? "").trim().length > 0,
+            "task.progress descriptions must be non-empty",
+          );
+        }
+
+        const completed = taskEvents.find((event) => event.method === "task/completed");
+        NodeAssert.ok(completed, "expected the run to complete");
+        NodeAssert.equal(payloadOf(completed).status, "completed");
+        // The child finished after the turn did, so it is not filed under a turn
+        // the user already saw end.
+        NodeAssert.equal(completed.turnId, undefined);
+        // The launch tool call is linked so the work log can fold its row away.
+        NodeAssert.equal(payloadOf(completed).toolUseId, BACKGROUND_TOOL_CALL_ID);
+        for (const event of taskEvents) {
+          NodeAssert.ok(
+            event.turnId === undefined || event.turnId === started.turnId,
+            "a task row must never be attributed to another turn",
+          );
+        }
+
+        // Replaying the same snapshots must not re-open a finished run.
+        yield* runtime.sendTurn({ text: "replay the same snapshots" });
+        const drain = yield* collectUntilTerminal(runtime);
+        NodeAssert.equal(drain.filter((event) => event.method === "task/completed").length, 0);
+        yield* runtime.close;
+      }),
+    ),
+  );
+
+  it.effect("drives a foreground child from its own tool call", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: FOREGROUND_CHILD,
+        });
+        const runtime = yield* startRuntime(harness);
+        const started = yield* runtime.sendTurn({ text: "run a foreground scout" });
+        const events = yield* collectUntil(
+          runtime,
+          (event) => event.method === "task/completed",
+          2000,
+        );
+        const taskEvents = events.filter((event) => event.method.startsWith("task/"));
+        const startedEvent = taskEvents.find((event) => event.method === "task/started");
+        NodeAssert.ok(startedEvent, "expected a row for the foreground child");
+        // No snapshot frames exist for foreground children, so the tool call id
+        // is the run's identity (the Antigravity batch precedent).
+        NodeAssert.equal(payloadOf(startedEvent).taskId, FOREGROUND_TOOL_CALL_ID);
+        NodeAssert.equal(payloadOf(startedEvent).toolUseId, FOREGROUND_TOOL_CALL_ID);
+        NodeAssert.equal(payloadOf(startedEvent).title, "scout");
+        NodeAssert.equal(startedEvent.turnId, started.turnId);
+
+        const completed = taskEvents.find((event) => event.method === "task/completed");
+        NodeAssert.ok(completed);
+        NodeAssert.equal(payloadOf(completed).status, "completed");
+        // Pi's own final output becomes the row's result line.
+        NodeAssert.equal(payloadOf(completed).summary, "pong");
+        NodeAssert.equal(payloadOf(completed).model, "openai-codex/gpt-5.6-luna:high");
+        yield* runtime.close;
+      }),
+    ),
+  );
+
+  it.effect(
+    "keeps a detached child running after an abort and stops its row with the session",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const eventsPath = writeJsonl([
+            {
+              type: "tool_execution_start",
+              toolCallId: "call-bg-1",
+              toolName: "subagent",
+              args: { agent: "scout", async: true },
+            },
+            subagentWidget([subagentRun("queued")]),
+            {
+              type: "tool_execution_end",
+              toolCallId: "call-bg-1",
+              toolName: "subagent",
+              result: { content: [], details: { asyncId: BACKGROUND_RUN_ID } },
+            },
+          ]);
+          const harness = makeFakeCli({
+            responses: {
+              get_state: { success: true, data: getStateData() },
+              prompt: { success: true },
+              abort: { success: true },
+            },
+            events: eventsPath,
+          });
+          const runtime = yield* startRuntime(harness);
+          yield* runtime.sendTurn({ text: "detach a child" });
+          yield* runtime.interruptTurn;
+          const aborted = yield* collectUntil(runtime, (event) => event.method === "turn/aborted");
+          NodeAssert.equal(aborted.filter((event) => event.method === "turn/aborted").length, 1);
+          // Aborting the parent kills neither a detached child nor its row.
+          NodeAssert.equal(aborted.filter((event) => event.method === "task/completed").length, 0);
+          const startedEvent = aborted.find((event) => event.method === "task/started");
+          NodeAssert.ok(startedEvent);
+          NodeAssert.equal(payloadOf(startedEvent).toolUseId, "call-bg-1");
+
+          // Closing the session is where the row is finally closed out, and the
+          // event has to survive the queue shutdown that follows it.
+          const collecting = yield* collectUntil(
+            runtime,
+            (event) => event.method === "task/completed",
+          ).pipe(Effect.forkScoped);
+          yield* runtime.close;
+          const closing = yield* Fiber.join(collecting);
+          const stopped = closing.find((event) => event.method === "task/completed");
+          NodeAssert.ok(stopped, "expected the live row to be closed at teardown");
+          NodeAssert.equal(payloadOf(stopped).status, "stopped");
+          NodeAssert.equal(payloadOf(stopped).taskId, BACKGROUND_RUN_ID);
+        }),
+      ),
+  );
+
+  it.effect("stops a foreground child's row when its turn is aborted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "tool_execution_start",
+            toolCallId: "call-fg-1",
+            toolName: "subagent",
+            args: { agent: "scout", async: false },
+          },
+          {
+            type: "tool_execution_update",
+            toolCallId: "call-fg-1",
+            toolName: "subagent",
+            partialResult: {
+              details: {
+                progress: [{ index: 0, agent: "scout", status: "running", recentOutput: ["pong"] }],
+              },
+            },
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+            abort: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        yield* runtime.sendTurn({ text: "run a foreground child" });
+        yield* runtime.interruptTurn;
+        const events = yield* collectUntil(runtime, (event) => event.method === "turn/aborted");
+        const taskEvents = events.filter((event) => event.method.startsWith("task/"));
+        const startedEvent = taskEvents.find((event) => event.method === "task/started");
+        NodeAssert.ok(startedEvent);
+        NodeAssert.equal(payloadOf(startedEvent).taskId, "call-fg-1");
+        // Progress carries the child's own output tail.
+        const progress = taskEvents.find((event) => event.method === "task/progress");
+        NodeAssert.ok(progress, "expected progress from the tool-call update");
+        NodeAssert.equal(payloadOf(progress).description, "pong");
+        // The child runs inside the tool call, so aborting the turn ends it.
+        const stopped = taskEvents.find((event) => event.method === "task/completed");
+        NodeAssert.ok(stopped, "expected the foreground row to be stopped");
+        NodeAssert.equal(payloadOf(stopped).status, "stopped");
+        yield* runtime.close;
+      }),
+    ),
+  );
+
+  it.effect("warns once when Pi truncates its subagent status snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          subagentWidget([subagentRun("queued")], {
+            runs: 3,
+            children: 0,
+            byteLimitExceeded: true,
+          }),
+          subagentWidget([subagentRun("running")], {
+            runs: 3,
+            children: 0,
+            byteLimitExceeded: true,
+          }),
+          { type: "agent_settled" },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        yield* runtime.sendTurn({ text: "launch a fleet" });
+        const events = yield* collectUntilTerminal(runtime);
+        const seen = methods(events);
+        // One warning per session, not one per heartbeat, and the visible run
+        // still renders.
+        NodeAssert.equal(seen.filter((method) => method === "runtime/warning").length, 1);
+        NodeAssert.equal(seen.filter((method) => method === "task/started").length, 1);
+        const warning = events.find((event) => event.method === "runtime/warning");
+        NodeAssert.match(warning?.message ?? "", /3 subagent run/u);
+        yield* runtime.close;
+      }),
+    ),
+  );
+
+  it("maps every Pi run state onto the T3 task vocabulary", () => {
+    // The wide status vocabulary has no "stopped"; only `task.completed` does.
+    NodeAssert.deepEqual(
+      [
+        "queued",
+        "running",
+        "paused",
+        "idle",
+        "complete",
+        "stopped",
+        "failed",
+        "partial",
+        "rejected",
+      ].map((state) => [state, piTaskStatusForState(state)]),
+      [
+        ["queued", "pending"],
+        ["running", "running"],
+        ["paused", "waiting"],
+        ["idle", "idle"],
+        ["complete", "completed"],
+        ["stopped", "cancelled"],
+        ["failed", "failed"],
+        ["partial", "failed"],
+        ["rejected", "failed"],
+      ],
+    );
+    // A state this build does not know stays live: a newer Pi must not have a
+    // running child reported as finished.
+    NodeAssert.equal(piTaskStatusForState("future_state"), "running");
+    NodeAssert.equal(piTaskCompletionForState("future_state"), undefined);
+    NodeAssert.deepEqual(
+      ["complete", "stopped", "failed", "partial", "rejected", "running", "paused", "idle"].map(
+        (state) => [state, piTaskCompletionForState(state)],
+      ),
+      [
+        ["complete", "completed"],
+        ["stopped", "stopped"],
+        ["failed", "failed"],
+        ["partial", "failed"],
+        ["rejected", "failed"],
+        ["running", undefined],
+        ["paused", undefined],
+        ["idle", undefined],
+      ],
+    );
+
+    // The status line is always usable, and a CI gate's own detail wins.
+    NodeAssert.equal(
+      piSubagentDescription({ id: "r", kind: "subagent", label: "scout", state: "running" }),
+      "Running",
+    );
+    NodeAssert.equal(
+      piSubagentDescription({
+        id: "r",
+        kind: "subagent",
+        label: "scout",
+        state: "running",
+        activity: { currentTool: "bash" },
+      }),
+      "Running bash",
+    );
+    NodeAssert.equal(
+      piSubagentDescription({
+        id: "r",
+        kind: "subagent",
+        label: "scout",
+        state: "running",
+        activity: { state: "needs_attention" },
+      }),
+      "Needs attention",
+    );
+    NodeAssert.equal(
+      piSubagentDescription({
+        id: "r",
+        kind: "subagent",
+        label: "scout",
+        state: "running",
+        hostStep: { detail: "CI gate waiting on approval" },
+      }),
+      "CI gate waiting on approval",
+    );
+    NodeAssert.equal(
+      piSubagentDescription({ id: "r", kind: "workflow", label: "fleet", state: "partial" }),
+      "One or more child runs failed",
+    );
+  });
+
+  it.effect("reports a paused or attention-needing child as waiting, not running", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Two runs so one snapshot exercises the resting and terminal branches
+        // of the same fold.
+        const pausedRun = { id: "run-paused", kind: "subagent", label: "auditor", state: "queued" };
+        const attentionRun = {
+          id: "run-attention",
+          kind: "subagent",
+          label: "builder",
+          state: "queued",
+        };
+        const eventsPath = writeJsonl([
+          subagentWidget([pausedRun, attentionRun]),
+          subagentWidget([
+            { ...pausedRun, state: "paused" },
+            { ...attentionRun, state: "running", activity: { state: "needs_attention" } },
+          ]),
+          subagentWidget([
+            { ...pausedRun, state: "partial" },
+            { ...attentionRun, state: "stopped" },
+          ]),
+          { type: "agent_settled" },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        yield* runtime.sendTurn({ text: "run two children" });
+        const events = yield* collectUntilTerminal(runtime);
+
+        const forTask = (taskId: string) =>
+          events.filter((event) => payloadOf(event).taskId === taskId);
+        const paused = forTask("run-paused");
+        // A resting run is a status patch, never a progress tick or a terminal.
+        NodeAssert.deepEqual(
+          paused.map((event) => event.method),
+          ["task/started", "task/updated", "task/completed"],
+        );
+        const pausedUpdated = paused[1];
+        const pausedCompleted = paused[2];
+        NodeAssert.ok(pausedUpdated, "expected the paused run to be reported as waiting");
+        NodeAssert.ok(pausedCompleted, "expected the partial run to finish");
+        NodeAssert.equal(payloadOf(pausedUpdated).status, "waiting");
+        NodeAssert.equal(payloadOf(pausedCompleted).status, "failed");
+        NodeAssert.equal(payloadOf(pausedCompleted).summary, "One or more child runs failed");
+
+        const attention = forTask("run-attention");
+        NodeAssert.deepEqual(
+          attention.map((event) => event.method),
+          ["task/started", "task/updated", "task/completed"],
+        );
+        const attentionUpdated = attention[1];
+        const attentionCompleted = attention[2];
+        NodeAssert.ok(attentionUpdated, "expected the attention signal to be reported");
+        NodeAssert.ok(attentionCompleted, "expected the stopped run to finish");
+        NodeAssert.equal(payloadOf(attentionUpdated).status, "waiting");
+        NodeAssert.equal(payloadOf(attentionUpdated).description, "Needs attention");
+        NodeAssert.equal(payloadOf(attentionCompleted).status, "stopped");
         yield* runtime.close;
       }),
     ),
