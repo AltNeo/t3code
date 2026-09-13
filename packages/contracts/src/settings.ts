@@ -730,6 +730,64 @@ export const GrokSettings = makeProviderSettingsSchema(
 export type GrokSettings = typeof GrokSettings.Type;
 
 /**
+ * Pi settings. Off by default: Pi is a new binding, so users opt in from
+ * Settings instead of every install probing for a `pi` binary.
+ *
+ * Pi owns its own models, providers, extensions, and skills. The agent
+ * directory is passed through as `PI_CODING_AGENT_DIR` rather than copied, so
+ * T3 never forks Pi's state.
+ */
+export const PiSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting("pi").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the Pi CLI binary.",
+        providerSettingsForm: { placeholder: "pi", clearWhenEmpty: "omit" },
+      }),
+    ),
+    agentDirectoryPath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Pi agent directory",
+        description:
+          "Passed to Pi as PI_CODING_AGENT_DIR. Leave empty to use Pi's own default (~/.pi/agent).",
+        providerSettingsForm: { placeholder: "~/.pi/agent", clearWhenEmpty: "omit" },
+      }),
+    ),
+    sessionDirPath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Session directory",
+        description:
+          "Where Pi stores session files. Leave empty to let Pi choose its default location.",
+        providerSettingsForm: { placeholder: "Default", clearWhenEmpty: "omit" },
+      }),
+    ),
+    launchArgs: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Launch arguments",
+        description: "Extra CLI arguments passed to `pi --mode rpc`.",
+        providerSettingsForm: { placeholder: "e.g. --offline", clearWhenEmpty: "omit" },
+      }),
+    ),
+    customModels: Schema.Array(CustomModelSetting).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["binaryPath", "agentDirectoryPath", "sessionDirPath", "launchArgs"],
+  },
+);
+export type PiSettings = typeof PiSettings.Type;
+
+/**
  * Antigravity ACP auth methods. Personal and Enterprise open a Google sign-in
  * in the browser. The API key and Agent Platform methods take credentials from
  * the instance config and never open a browser.
@@ -1157,6 +1215,7 @@ export const ServerSettings = Schema.Struct({
     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    pi: PiSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     antigravity: AntigravitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
@@ -1314,6 +1373,15 @@ const GrokSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 
+const PiSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  agentDirectoryPath: Schema.optionalKey(TrimmedString),
+  sessionDirPath: Schema.optionalKey(TrimmedString),
+  launchArgs: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
+});
+
 const AntigravitySettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   authMethod: Schema.optionalKey(AntigravityAuthMethod),
@@ -1404,6 +1472,7 @@ export const ServerSettingsPatch = Schema.Struct({
       claudeAgent: Schema.optionalKey(ClaudeSettingsPatch),
       cursor: Schema.optionalKey(CursorSettingsPatch),
       grok: Schema.optionalKey(GrokSettingsPatch),
+      pi: Schema.optionalKey(PiSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
       antigravity: Schema.optionalKey(AntigravitySettingsPatch),
     }),

@@ -148,6 +148,13 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+export const PI_DRIVER_KIND = ProviderDriverKind.make("pi");
+
+/**
+ * Product slug, not a Pi model id: Pi resolves models from its own provider
+ * configuration, so T3 asks for "whatever this Pi is configured to use".
+ */
+export const PI_DEFAULT_MODEL_SLUG = "pi-default";
 
 export const DEFAULT_MODEL = "gpt-6-astra";
 
@@ -173,6 +180,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   // Product slug, not an ACP model id. The Grok adapter treats it as "the session's current model".
   [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  [PI_DRIVER_KIND]: PI_DEFAULT_MODEL_SLUG,
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
 };
 
@@ -185,6 +193,7 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  [PI_DRIVER_KIND]: PI_DEFAULT_MODEL_SLUG,
 };
 
 export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
