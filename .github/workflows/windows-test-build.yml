@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           git remote add upstream https://github.com/pingdotgg/t3code.git
           git fetch --no-tags upstream main
-          git merge --no-commit --no-ff upstream/main
+          git -c user.name=t3-ci -c user.email=t3-ci@users.noreply.github.com merge --no-commit --no-ff upstream/main
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
