@@ -1,4 +1,5 @@
 import { useScopedSettings, useUpdateScopedSettings } from "./useScopedSettings";
+import { ScopedSwitch } from "./ScopedSwitch";
 import { DeviceHostsSettings } from "./DeviceHostsSettings";
 /**
  * Integrations settings - preferences for surfaces T3 Code embeds rather than
@@ -654,7 +655,8 @@ function DeviceIntegrationControls({
         control={
           <>
             {pending === "hub" ? <DeviceHubSetupStatus state={state} pending compact /> : null}
-            <Switch
+            <ScopedSwitch
+              settingKeys={["enableDeviceSupport"]}
               checked={enabled}
               disabled={projectScope || !loaded || !environmentId || busy || pending !== null}
               aria-label="Device hub"
@@ -712,7 +714,8 @@ function DeviceIntegrationControls({
         control={
           <>
             {pending === "agent" ? <AgentDeviceSetupStatus state={state} pending compact /> : null}
-            <Switch
+            <ScopedSwitch
+              settingKeys={["enableAgentDeviceAccess"]}
               checked={agentAccessEnabled}
               disabled={
                 connectedEnvironments.length === 0 ||

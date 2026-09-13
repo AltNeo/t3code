@@ -40,4 +40,18 @@ describe("device host changes across environments", () => {
       shared,
     ]);
   });
+
+  it("prefers the selected ID over a sibling with the same destination", () => {
+    const sibling = { ...shared, id: "sibling", label: "Another entry" };
+    const edited = { ...shared, label: "Renamed" };
+    expect(updateDeviceHosts([sibling, shared], edited, false, shared)).toEqual([sibling, edited]);
+    expect(updateDeviceHosts([sibling, shared], shared, true)).toEqual([sibling]);
+  });
+
+  it("refuses an ambiguous destination on another environment instead of changing a sibling", () => {
+    const remote = { ...shared, id: "remote" };
+    const sibling = { ...shared, id: "sibling" };
+    expect(() => updateDeviceHosts([remote, sibling], shared, true)).toThrow("Multiple hosts");
+    expect(() => updateDeviceHosts([remote, sibling], shared, false)).toThrow("Multiple hosts");
+  });
 });

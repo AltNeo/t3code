@@ -11,13 +11,22 @@ export function updateDeviceHosts(
     candidate.target === other.target &&
     candidate.port === other.port &&
     candidate.identityFile === other.identityFile;
-  const matches = (candidate: SshDeviceHostConfig) =>
-    candidate.id === original.id || sameDestination(candidate, original);
-  if (remove) return hosts.filter((candidate) => !matches(candidate));
+  const findDestination = (destination: SshDeviceHostConfig) => {
+    const matches = hosts.filter((candidate) => sameDestination(candidate, destination));
+    if (matches.length > 1) {
+      throw new Error(
+        "Multiple hosts match this SSH destination. Select the environment to edit its hosts.",
+      );
+    }
+    return matches[0];
+  };
   // A retry can encounter the updated destination on an environment that
   // already saved, including one with a different environment-local host ID.
   const existing =
-    hosts.find(matches) ?? hosts.find((candidate) => sameDestination(candidate, host));
+    hosts.find((candidate) => candidate.id === original.id) ??
+    findDestination(original) ??
+    (remove ? undefined : findDestination(host));
+  if (remove) return hosts.filter((candidate) => candidate.id !== existing?.id);
   return existing
     ? hosts.map((candidate) =>
         candidate.id === existing.id ? { ...host, id: existing.id } : candidate,
