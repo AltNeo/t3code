@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
+  ApprovalRequestId,
   EventId,
   PiSettings,
   ProviderDriverKind,
@@ -15,11 +16,14 @@ import {
   type ProviderEvent,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type ProviderUserInputAnswers,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it } from "@effect/vitest";
 
+import { ProviderAdapterValidationError } from "../Errors.ts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -111,6 +115,10 @@ class FakePiRuntime implements PiSessionRuntimeShape {
     });
   }
 
+  respondToUserInput(_requestId: ApprovalRequestId, _answers: ProviderUserInputAnswers) {
+    return Effect.void;
+  }
+
   readThreadMessages = Effect.succeed([
     { role: "user", content: [{ type: "text", text: "hi" }] },
   ] as ReadonlyArray<unknown>);
@@ -119,7 +127,11 @@ class FakePiRuntime implements PiSessionRuntimeShape {
 
   close = Effect.sync(() => {
     this.counts.close += 1;
-  });
+  }).pipe(
+    Effect.andThen(
+      Queue.end(this.eventQueue as unknown as Queue.Enqueue<ProviderEvent, Cause.Done>),
+    ),
+  );
 
   closed = Effect.succeed(false);
 
@@ -402,16 +414,25 @@ it.layer(adapterLayer)("PiAdapter session wiring", (it) => {
     }),
   );
 
-  it.effect("warns that a stricter runtime mode is not enforced", () =>
+  it.effect("refuses every stricter runtime mode before spawning Pi", () =>
     Effect.gen(function* () {
       const adapter = yield* PiAdapterService;
-      yield* startSession(adapter, THREADS.warn, "approval-required");
-      const events = unwrap(
-        yield* collectEvents(adapter, (event) => event.type === "config.warning"),
-      );
-      const warning = events.find((event) => event.type === "config.warning");
-      NodeAssert.ok(warning, "a config.warning was emitted");
-      NodeAssert.match((warning?.payload as { summary: string }).summary, /not enforced/u);
+      for (const runtimeMode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+        const result = yield* adapter
+          .startSession({
+            threadId: THREADS.warn,
+            cwd: process.cwd(),
+            runtimeMode,
+          })
+          .pipe(Effect.exit);
+        NodeAssert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          const error = Cause.squash(result.cause);
+          NodeAssert.ok(Schema.is(ProviderAdapterValidationError)(error));
+          NodeAssert.match(error.message, /full-access only/u);
+        }
+      }
+      NodeAssert.equal(sharedRuntime.counts.close, 0);
     }),
   );
 
@@ -454,10 +475,6 @@ it.layer(adapterLayer)("PiAdapter session wiring", (it) => {
         .respondToRequest(THREADS.compact, "request-1" as never, "accept")
         .pipe(Effect.exit);
       NodeAssert.equal(approval._tag, "Failure");
-      const userInput = yield* adapter
-        .respondToUserInput(THREADS.compact, "request-2" as never, {})
-        .pipe(Effect.exit);
-      NodeAssert.equal(userInput._tag, "Failure");
       NodeAssert.equal(yield* adapter.hasSession(THREADS.compact), true);
       const history = yield* adapter.readThread(THREADS.compact);
       NodeAssert.equal(history.turns.length, 1);

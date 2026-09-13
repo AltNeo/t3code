@@ -283,8 +283,16 @@ export const PiExtensionUiRequest = Schema.Struct({
   method: Schema.String,
   title: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
+  options: Schema.optional(Schema.Array(Schema.String)),
+  timeout: Schema.optional(Schema.Finite),
+  placeholder: Schema.optional(Schema.String),
+  prefill: Schema.optional(Schema.String),
   widgetKey: Schema.optional(Schema.String),
   widgetLines: Schema.optional(Schema.Array(Schema.String)),
+  notifyType: Schema.optional(Schema.String),
+  statusKey: Schema.optional(Schema.String),
+  statusText: Schema.optional(Schema.String),
+  text: Schema.optional(Schema.String),
 });
 export type PiExtensionUiRequest = typeof PiExtensionUiRequest.Type;
 
@@ -293,7 +301,7 @@ export const decodePiExtensionUiRequest = Schema.decodeUnknownOption(PiExtension
 const PI_DIALOG_METHODS = ["select", "confirm", "input", "editor"] as const;
 
 /** True for the four methods that block until the client answers. */
-export const isPiDialogMethod = (method: string): boolean =>
+export const isPiDialogMethod = (method: string): method is (typeof PI_DIALOG_METHODS)[number] =>
   (PI_DIALOG_METHODS as ReadonlyArray<string>).includes(method);
 
 export const piDialogCancelledResponse = (id: string) => ({

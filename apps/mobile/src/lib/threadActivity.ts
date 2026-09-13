@@ -313,6 +313,14 @@ function resolvePendingUserInputAnswer(
   draft: PendingUserInputDraftAnswer | undefined,
 ): string | ReadonlyArray<string> | null {
   if (draft?.attachmentsBlocked) return null;
+  if (
+    question.allowCustomAnswer !== false &&
+    draft?.customAnswer === undefined &&
+    question.initialValue !== undefined &&
+    question.initialValue.trim().length > 0
+  ) {
+    return question.initialValue;
+  }
   const customAnswer =
     question.allowCustomAnswer === false ? null : normalizeDraftAnswer(draft?.customAnswer);
   if (customAnswer) {

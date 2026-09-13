@@ -79,6 +79,8 @@ function parseQuestions(value: unknown): UserInputQuestion[] {
       ...(typeof question.allowCustomAnswer === "boolean"
         ? { allowCustomAnswer: question.allowCustomAnswer }
         : {}),
+      ...(typeof question.initialValue === "string" ? { initialValue: question.initialValue } : {}),
+      ...(typeof question.placeholder === "string" ? { placeholder: question.placeholder } : {}),
     });
     return Option.isSome(parsed) ? [parsed.value] : [];
   });

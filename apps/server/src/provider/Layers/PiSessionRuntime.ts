@@ -16,6 +16,7 @@
  * @module provider/PiSessionRuntime
  */
 import {
+  ApprovalRequestId,
   EventId,
   ProviderDriverKind,
   ProviderItemId,
@@ -25,13 +26,16 @@ import {
   type ProviderInstanceId,
   type RuntimeMode,
   type RuntimeTaskStatus,
+  type ProviderUserInputAnswers,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
-import type * as Duration from "effect/Duration";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -209,6 +213,10 @@ export interface PiSessionRuntimeShape {
   readonly getSession: Effect.Effect<ProviderSession>;
   readonly sendTurn: (input: PiSendTurnInput) => Effect.Effect<PiTurnStart, PiSessionRuntimeError>;
   readonly interruptTurn: Effect.Effect<void, PiSessionRuntimeError>;
+  readonly respondToUserInput: (
+    requestId: ApprovalRequestId,
+    answers: ProviderUserInputAnswers,
+  ) => Effect.Effect<void, PiSessionRuntimeError>;
   /** Manual compaction; resolves once Pi reports the compaction finished. */
   readonly compactThread: Effect.Effect<void, PiSessionRuntimeError>;
   readonly readThreadMessages: Effect.Effect<ReadonlyArray<unknown>, PiSessionRuntimeError>;
@@ -640,6 +648,134 @@ export const makePiSessionRuntime = (
         method,
         message,
         ...(payload !== undefined ? { payload } : {}),
+      });
+
+    interface PendingPiDialog {
+      readonly requestId: ApprovalRequestId;
+      readonly piId: string;
+      readonly method: "select" | "confirm" | "input" | "editor";
+      readonly turnId?: TurnId;
+    }
+    interface DialogState {
+      readonly lifecycle: "open" | "closing" | "exited";
+      readonly pending: Map<string, PendingPiDialog>;
+      readonly resolving: Map<string, Deferred.Deferred<void>>;
+    }
+    // One Ref is the arbiter for registration, claiming, and teardown. Keeping
+    // lifecycle and ownership in the same atomic state prevents a late frame
+    // from landing between a lifecycle check and pending-map insertion.
+    const dialogStateRef = yield* Ref.make<DialogState>({
+      lifecycle: "open",
+      pending: new Map(),
+      resolving: new Map(),
+    });
+
+    const emitDialogResolved = (pending: PendingPiDialog, answer: unknown) =>
+      emitEvent({
+        kind: "notification",
+        threadId: options.threadId,
+        method: "user-input/resolved",
+        requestId: pending.requestId,
+        ...(pending.turnId !== undefined ? { turnId: pending.turnId } : {}),
+        payload: { answers: { [pending.piId]: answer } },
+      });
+
+    const cancelUnownedDialog = (id: string) =>
+      Ref.get(dialogStateRef).pipe(
+        Effect.flatMap((state) =>
+          state.lifecycle === "exited"
+            ? Effect.void
+            : connection.notify(piDialogCancelledResponse(id)).pipe(Effect.ignore),
+        ),
+      );
+
+    const registerDialog = (
+      pending: PendingPiDialog,
+    ): Effect.Effect<{
+      readonly accepted: boolean;
+      readonly lifecycle: DialogState["lifecycle"];
+    }> =>
+      Ref.modify(dialogStateRef, (state) => {
+        if (state.lifecycle !== "open")
+          return [{ accepted: false, lifecycle: state.lifecycle }, state] as [
+            { readonly accepted: boolean; readonly lifecycle: DialogState["lifecycle"] },
+            DialogState,
+          ];
+        const next = new Map(state.pending);
+        next.set(pending.piId, pending);
+        return [
+          { accepted: true, lifecycle: "open" as const },
+          { ...state, pending: next },
+        ] as [
+          { readonly accepted: boolean; readonly lifecycle: DialogState["lifecycle"] },
+          DialogState,
+        ];
+      });
+
+    const claimDialog = (
+      pending: PendingPiDialog,
+      resolving: Deferred.Deferred<void>,
+      allowClosing = false,
+    ) =>
+      Ref.modify(dialogStateRef, (state) => {
+        if (
+          state.pending.get(pending.piId) !== pending ||
+          (state.lifecycle === "exited" && !allowClosing) ||
+          (state.lifecycle === "closing" && !allowClosing)
+        )
+          return [undefined, state] as const;
+        const nextPending = new Map(state.pending);
+        nextPending.delete(pending.piId);
+        const nextResolving = new Map(state.resolving);
+        nextResolving.set(pending.piId, resolving);
+        return [
+          { resolving },
+          { ...state, pending: nextPending, resolving: nextResolving },
+        ] as const;
+      });
+
+    const resolveDialog = (
+      pending: PendingPiDialog,
+      answer: unknown,
+      cancelled: boolean,
+      notify = true,
+      allowClosing = false,
+    ) =>
+      Effect.gen(function* () {
+        const resolving = yield* Deferred.make<void>();
+        const claim = yield* claimDialog(pending, resolving, allowClosing);
+        if (claim === undefined) return;
+        const finish = Effect.gen(function* () {
+          if (notify) {
+            const frame = cancelled
+              ? piDialogCancelledResponse(pending.piId)
+              : pending.method === "confirm"
+                ? { type: "extension_ui_response", id: pending.piId, confirmed: answer === true }
+                : { type: "extension_ui_response", id: pending.piId, value: answer };
+            // Claiming the dialog already makes this terminal on the T3 side.
+            // Publish that fact before enqueueing the best-effort Pi reply so a
+            // stalled transport cannot leave the UI pending indefinitely.
+            yield* emitDialogResolved(pending, cancelled ? null : answer);
+            const written = yield* connection.notify(frame).pipe(Effect.result);
+            if (written._tag === "Failure") {
+              // The provider reply was not accepted, but the question is still
+              // closed locally; terminate the broken transport without masking
+              // the resolved event with a second resolution.
+              yield* connection.close.pipe(Effect.ignore);
+            }
+          } else {
+            yield* emitDialogResolved(pending, cancelled ? null : answer);
+          }
+        }).pipe(
+          Effect.ensuring(
+            Ref.update(dialogStateRef, (state) => {
+              const resolving = new Map(state.resolving);
+              resolving.delete(pending.piId);
+              return { ...state, resolving };
+            }).pipe(Effect.andThen(Deferred.succeed(claim.resolving, undefined)), Effect.ignore),
+          ),
+        );
+        yield* finish;
       });
 
     // --- Subagent trail -------------------------------------------------
@@ -1349,7 +1485,17 @@ export const makePiSessionRuntime = (
           }
           case "extension_ui_request": {
             const decoded = decodePiExtensionUiRequest(frame);
-            if (Option.isNone(decoded)) return;
+            if (Option.isNone(decoded)) {
+              const malformedId = typeof frame.id === "string" ? frame.id : undefined;
+              if (malformedId !== undefined) {
+                yield* cancelUnownedDialog(malformedId);
+              }
+              yield* emitWarning(
+                "runtime/warning",
+                "Malformed Pi extension UI request was cancelled.",
+              );
+              return;
+            }
             const request = decoded.value;
             if (
               request.method === "setWidget" &&
@@ -1368,19 +1514,93 @@ export const makePiSessionRuntime = (
               return;
             }
             if (!isPiDialogMethod(request.method)) {
-              // notify/setStatus/... are fire-and-forget, and setWidget frames for
-              // other widgets are not this bridge's business.
+              // Known fire-and-forget methods do not receive a response. An
+              // unknown method with an id may nevertheless be blocking in a
+              // newer Pi, so cancel it rather than leaving the process hung.
+              const known = new Set([
+                "notify",
+                "setStatus",
+                "setTitle",
+                "set_editor_text",
+                "setWidget",
+              ]);
+              if (known.has(request.method)) return;
+              yield* cancelUnownedDialog(request.id);
+              yield* emitWarning(
+                "runtime/warning",
+                `Unsupported Pi extension UI method '${request.method}' was cancelled.`,
+                { method: request.method },
+              );
               return;
             }
-            // Milestone 1 has no dialog bridge. Answering keeps an extension
-            // from blocking the agent forever, and the warning tells the user
-            // the prompt was skipped rather than answered.
-            yield* connection.notify(piDialogCancelledResponse(request.id)).pipe(Effect.ignore);
-            yield* emitWarning(
-              "runtime/warning",
-              `Pi extension requested '${request.method}' input, which this build cannot answer. The prompt was declined.`,
-              { method: request.method, title: request.title ?? null },
-            );
+            const turnId =
+              activeTurn !== undefined && !activeTurn.settled ? activeTurn.turnId : undefined;
+            const requestId = ApprovalRequestId.make(request.id);
+            const title = request.title?.trim() || "Pi extension question";
+            const prompt = request.message?.trim() || title;
+            const initialText = request.prefill;
+            const placeholder = request.placeholder;
+            const question = prompt;
+            const dialogOptions =
+              request.method === "confirm"
+                ? [
+                    { label: "Confirm", description: "Confirm", value: "true" },
+                    { label: "Cancel", description: "Cancel", value: "false" },
+                  ]
+                : (request.options ?? []).map((label) => ({
+                    label,
+                    description: label,
+                    value: label,
+                  }));
+            if (request.method === "select" && dialogOptions.length === 0) {
+              yield* cancelUnownedDialog(request.id);
+              yield* emitWarning(
+                "runtime/warning",
+                "Malformed Pi select dialog had no options; it was cancelled.",
+              );
+              return;
+            }
+            const pending: PendingPiDialog = {
+              requestId,
+              piId: request.id,
+              method: request.method,
+              ...(turnId !== undefined ? { turnId } : {}),
+            };
+            const registration = yield* registerDialog(pending);
+            if (!registration.accepted) {
+              // Teardown won ownership; cancel while closing, but never write
+              // after exit (the process can no longer consume the frame).
+              if (registration.lifecycle === "closing") {
+                yield* cancelUnownedDialog(request.id);
+              }
+              return;
+            }
+            if (request.timeout !== undefined && request.timeout > 0) {
+              yield* Effect.sleep(Duration.millis(request.timeout)).pipe(
+                Effect.andThen(resolveDialog(pending, null, true, false)),
+                Effect.forkIn(runtimeScope),
+              );
+            }
+            yield* emitEvent({
+              kind: "request",
+              threadId: options.threadId,
+              method: "user-input/requested",
+              requestId,
+              ...(turnId !== undefined ? { turnId } : {}),
+              payload: {
+                questions: [
+                  {
+                    id: request.id,
+                    header: title,
+                    question,
+                    options: dialogOptions,
+                    ...(initialText !== undefined ? { initialValue: initialText } : {}),
+                    ...(placeholder !== undefined ? { placeholder } : {}),
+                    allowCustomAnswer: request.method === "input" || request.method === "editor",
+                  },
+                ],
+              },
+            });
             return;
           }
           case "session_info_changed": {
@@ -1424,7 +1644,9 @@ export const makePiSessionRuntime = (
         }
       });
 
-    yield* Stream.runForEach(connection.frames, handleFrame).pipe(Effect.forkIn(runtimeScope));
+    const frameConsumer = yield* Stream.runForEach(connection.frames, handleFrame).pipe(
+      Effect.forkIn(runtimeScope),
+    );
 
     yield* Stream.runForEach(connection.stderrLines, (line) =>
       line.trim().length === 0
@@ -1442,8 +1664,22 @@ export const makePiSessionRuntime = (
     yield* connection.exited.pipe(
       Effect.flatMap((exit) =>
         Effect.gen(function* () {
-          const alreadyClosed = yield* Ref.get(closedRef);
+          const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
           if (alreadyClosed) return;
+          // The connection ends frames only after stdout has been fully parsed.
+          // Join the consumer before claiming dialog ownership so its final
+          // frame is handled before any exit events are emitted.
+          yield* Fiber.join(frameConsumer);
+          // Claim ownership before draining: no subsequent dialog may become
+          // pending while exit cancellation events are being emitted.
+          const dialogSnapshot = yield* Ref.modify(
+            dialogStateRef,
+            (state) =>
+              [
+                { pending: [...state.pending.values()], resolving: [...state.resolving.values()] },
+                { ...state, lifecycle: "exited" as const },
+              ] as const,
+          );
           const turn = yield* Ref.get(activeTurnRef);
           if (turn !== undefined && !turn.settled) {
             turn.settled = true;
@@ -1459,6 +1695,14 @@ export const makePiSessionRuntime = (
           yield* updateSession({ status: "error", activeTurnId: undefined });
           // The session is gone, so nothing can report on these rows again.
           yield* stopSubagentRuns(false, "Stopped when the Pi session exited.").pipe(Effect.ignore);
+          yield* Effect.forEach(
+            dialogSnapshot.pending,
+            (pending) => resolveDialog(pending, null, true, false, true),
+            {
+              discard: true,
+            },
+          );
+          yield* Effect.forEach(dialogSnapshot.resolving, Deferred.await, { discard: true });
           yield* emitEvent({
             kind: "session",
             threadId: options.threadId,
@@ -1470,6 +1714,9 @@ export const makePiSessionRuntime = (
               exitKind: exit.code === 0 ? "graceful" : "error",
             },
           });
+          // End only after terminal runtime events have been offered so the
+          // adapter can drain them deterministically.
+          yield* Queue.end(events as unknown as Queue.Enqueue<ProviderEvent, Cause.Done>);
         }),
       ),
       Effect.forkIn(runtimeScope),
@@ -1724,24 +1971,54 @@ export const makePiSessionRuntime = (
       }),
     );
 
-    /** Best-effort drain: lets the adapter's consumer take events that were
-     * emitted immediately before the queue shuts down. */
-    const drainPendingEvents = Effect.gen(function* () {
-      for (let attempt = 0; attempt < 64; attempt += 1) {
-        if ((yield* Queue.size(events)) === 0) return;
-        yield* Effect.yieldNow;
-      }
-    });
+    const respondToUserInput = (requestId: ApprovalRequestId, answers: ProviderUserInputAnswers) =>
+      Effect.gen(function* () {
+        const pending = [...(yield* Ref.get(dialogStateRef)).pending.values()].find(
+          (entry) => entry.requestId === requestId,
+        );
+        if (pending === undefined) {
+          return yield* new PiSessionRequestError({
+            threadId: options.threadId,
+            operation: `user-input/${requestId}`,
+            detail: "Unknown pending Pi extension dialog.",
+          });
+        }
+        const raw = answers[pending.piId];
+        const cancelled = raw === null || raw === undefined;
+        const answer =
+          pending.method === "confirm"
+            ? raw === true || raw === "true" || raw === "Confirm"
+            : Array.isArray(raw)
+              ? raw[0]
+              : raw;
+        yield* resolveDialog(pending, answer, cancelled);
+      });
 
-    const close = Effect.gen(function* () {
+    const close: Effect.Effect<void> = Effect.gen(function* () {
       const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
       if (alreadyClosed) return;
-      // Live subagent rows are closed out while the queue is still open: after
-      // `Queue.shutdown` an emitted event would never reach the consumer.
+      // Transition and snapshot atomically; late frames are rejected and
+      // cannot create an orphan question.
+      const dialogSnapshot = yield* Ref.modify(
+        dialogStateRef,
+        (state) =>
+          [
+            { pending: [...state.pending.values()], resolving: [...state.resolving.values()] },
+            { ...state, lifecycle: "closing" as const },
+          ] as const,
+      );
+      // Live rows and dialogs are closed out while the queue is still open.
       yield* stopSubagentRuns(false, "Stopped when the session closed.").pipe(Effect.ignore);
-      yield* drainPendingEvents;
+      yield* Effect.forEach(
+        dialogSnapshot.pending,
+        (pending) => resolveDialog(pending, null, true, true, true).pipe(Effect.ignore),
+        { discard: true },
+      );
+      yield* Effect.forEach(dialogSnapshot.resolving, Deferred.await, { discard: true });
       yield* connection.close.pipe(Effect.ignore);
-      yield* Queue.shutdown(events);
+      // Queue.end preserves buffered events and lets the adapter acknowledge
+      // delivery by joining its event fiber.
+      yield* Queue.end(events as unknown as Queue.Enqueue<ProviderEvent, Cause.Done>);
     });
     yield* Effect.addFinalizer(() => connection.close.pipe(Effect.ignore));
 
@@ -1750,6 +2027,7 @@ export const makePiSessionRuntime = (
       getSession: Ref.get(sessionRef),
       sendTurn,
       interruptTurn,
+      respondToUserInput,
       compactThread,
       readThreadMessages,
       unknownEvents: Ref.get(unknownEventsRef),

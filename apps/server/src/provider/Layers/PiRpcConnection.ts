@@ -127,11 +127,11 @@ export const makePiRpcConnection = (
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const scope = yield* Scope.Scope;
     const exitDeferred = yield* Deferred.make<PiProcessExit>();
-    const pendingRef = yield* Ref.make(
-      new Map<string, Deferred.Deferred<PiResponse, PiRpcError>>(),
-    );
+    const transportRef = yield* Ref.make({
+      closed: false,
+      pending: new Map<string, Deferred.Deferred<PiResponse, PiRpcError>>(),
+    });
     const counterRef = yield* Ref.make(0);
-    const closedRef = yield* Ref.make(false);
     const frames = yield* Queue.unbounded<PiFrame>();
     const stderrQueue = yield* Queue.unbounded<string>();
     const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
@@ -162,11 +162,11 @@ export const makePiRpcConnection = (
 
     const failPending = (error: PiRpcError) =>
       Effect.gen(function* () {
-        const pending = yield* Ref.getAndSet(
-          pendingRef,
-          new Map<string, Deferred.Deferred<PiResponse, PiRpcError>>(),
+        const pending = yield* Ref.modify(
+          transportRef,
+          (state) => [[...state.pending.values()], { ...state, pending: new Map() }] as const,
         );
-        yield* Effect.forEach(pending.values(), (deferred) => Deferred.fail(deferred, error), {
+        yield* Effect.forEach(pending, (deferred) => Deferred.fail(deferred, error), {
           discard: true,
         });
       });
@@ -189,23 +189,25 @@ export const makePiRpcConnection = (
           });
           return;
         }
-        const pending = yield* Ref.get(pendingRef);
-        const deferred = pending.get(response.id);
+        const pending = yield* Ref.get(transportRef);
+        const deferred = pending.pending.get(response.id);
         if (deferred === undefined) {
           yield* Effect.logDebug("Ignoring Pi response for unknown request id.", {
             command: response.command,
           });
           return;
         }
-        yield* Ref.update(pendingRef, (current) => {
-          const next = new Map(current);
+        yield* Ref.update(transportRef, (state) => {
+          const next = new Map(state.pending);
           next.delete(response.id as string);
-          return next;
+          return { ...state, pending: next };
         });
         yield* Deferred.succeed(deferred, response);
       });
 
     let buffer = "";
+
+    const stdoutDone = yield* Deferred.make<void>();
 
     yield* child.stdout.pipe(
       Stream.decodeText(),
@@ -233,6 +235,11 @@ export const makePiRpcConnection = (
               yield* handleFrame(frame);
             }
           }
+          // Preserve every frame parsed from stdout before completing the
+          // stream. Queue.shutdown would discard frames buffered ahead of the
+          // process-exit signal (including a final blocking UI request).
+          yield* Queue.end(frames as unknown as Queue.Enqueue<PiFrame, Cause.Done>);
+          yield* Deferred.succeed(stdoutDone, undefined);
         }),
       ),
       Effect.forkIn(scope),
@@ -257,10 +264,14 @@ export const makePiRpcConnection = (
         Effect.gen(function* () {
           const code = Exit.isSuccess(exit) ? Number(exit.value) : -1;
           const info: PiProcessExit = { pid: child.pid, code };
+          // Process exit can race stdout close. Wait for the reader's final
+          // record (and its queue end) before publishing transport/session exit.
+          yield* Deferred.await(stdoutDone);
+          yield* Ref.update(transportRef, (state) => ({ ...state, closed: true }));
+          yield* Queue.end(outgoing);
           yield* Deferred.succeed(exitDeferred, info);
           yield* failPending(new PiRpcProcessExitedError({ pid: child.pid, code }));
-          yield* Queue.shutdown(frames);
-          yield* Queue.shutdown(stderrQueue);
+          yield* Queue.end(stderrQueue as unknown as Queue.Enqueue<string, Cause.Done>);
         }),
       ),
       Effect.forkIn(scope),
@@ -268,7 +279,7 @@ export const makePiRpcConnection = (
 
     const writeFrame = (frame: Readonly<Record<string, unknown>>) =>
       Effect.gen(function* () {
-        if (yield* Ref.get(closedRef)) {
+        if (yield* Ref.get(transportRef).pipe(Effect.map((state) => state.closed))) {
           return yield* new PiRpcWriteError({
             command: String(frame.type ?? "unknown"),
             detail: "The Pi RPC connection is closed.",
@@ -287,25 +298,39 @@ export const makePiRpcConnection = (
       Effect.gen(function* () {
         const id = yield* Ref.modify(counterRef, (current) => [String(current + 1), current + 1]);
         const deferred = yield* Deferred.make<PiResponse, PiRpcError>();
-        yield* Ref.update(pendingRef, (current) => {
-          const next = new Map(current);
+        const accepted = yield* Ref.modify(transportRef, (state) => {
+          if (state.closed) return [false, state] as const;
+          const next = new Map(state.pending);
           next.set(id, deferred);
-          return next;
+          return [true, { ...state, pending: next }] as const;
         });
-        yield* writeFrame({ ...frame, id });
+        if (!accepted) {
+          return yield* new PiRpcWriteError({
+            command: String(frame.type ?? "unknown"),
+            detail: "The Pi RPC connection is closed.",
+          });
+        }
+        const writeResult = yield* writeFrame({ ...frame, id }).pipe(Effect.result);
+        if (writeResult._tag === "Failure") {
+          yield* failPending(writeResult.failure);
+          return yield* writeResult.failure;
+        }
         return yield* Deferred.await(deferred).pipe(
           Effect.onInterrupt(() =>
-            Ref.update(pendingRef, (current) => {
-              const next = new Map(current);
+            Ref.update(transportRef, (state) => {
+              const next = new Map(state.pending);
               next.delete(id);
-              return next;
+              return { ...state, pending: next };
             }),
           ),
         );
       });
 
     const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
+      const alreadyClosed = yield* Ref.modify(
+        transportRef,
+        (state) => [state.closed, { ...state, closed: true }] as const,
+      );
       if (alreadyClosed) return;
       // Pi exits on stdin EOF; only kill it when it does not.
       yield* Queue.end(outgoing);
@@ -328,7 +353,7 @@ export const makePiRpcConnection = (
       frames: Stream.fromQueue(frames),
       stderrLines: Stream.fromQueue(stderrQueue),
       exited: Deferred.await(exitDeferred),
-      isClosed: Ref.get(closedRef),
+      isClosed: Ref.get(transportRef).pipe(Effect.map((state) => state.closed)),
       close,
     } satisfies PiRpcConnectionShape;
   });

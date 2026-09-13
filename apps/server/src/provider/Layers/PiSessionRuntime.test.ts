@@ -13,12 +13,15 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { buildPiProcessEnvironment } from "../Layers/PiProvider.ts";
 import { writeFakeCli } from "../../testUtils/fakeCli.ts";
@@ -78,6 +81,7 @@ interface PeerOptions {
   readonly events?: string;
   readonly eventsAfter?: Readonly<Record<string, string | ReadonlyArray<string>>>;
   readonly respondAfterEvents?: ReadonlyArray<string>;
+  readonly exitAfter?: ReadonlyArray<string>;
   readonly environment?: NodeJS.ProcessEnv;
 }
 
@@ -161,6 +165,8 @@ const subagentWidget = (
 
 const payloadOf = (event: ProviderEvent): Readonly<Record<string, unknown>> =>
   (event.payload ?? {}) as Readonly<Record<string, unknown>>;
+const questionOf = (event: ProviderEvent): Readonly<Record<string, unknown>> =>
+  (payloadOf(event).questions as ReadonlyArray<Readonly<Record<string, unknown>>>)[0]!;
 
 const makeFakeCli = (options: PeerOptions): PeerHarness => {
   const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-mock-"));
@@ -172,6 +178,7 @@ const makeFakeCli = (options: PeerOptions): PeerHarness => {
       responses: options.responses,
       ...(options.eventsAfter ? { eventsAfter: options.eventsAfter } : {}),
       ...(options.respondAfterEvents ? { respondAfterEvents: options.respondAfterEvents } : {}),
+      ...(options.exitAfter ? { exitAfter: options.exitAfter } : {}),
     }),
     "utf8",
   );
@@ -887,6 +894,474 @@ it.layer(NodeServices.layer)("PiSessionRuntime", (it) => {
         NodeAssert.equal(payloadOf(attentionUpdated).description, "Needs attention");
         NodeAssert.equal(payloadOf(attentionCompleted).status, "stopped");
         yield* runtime.close;
+      }),
+    ),
+  );
+
+  it.effect("round-trips a select dialog through a real mock Pi peer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "select-one",
+            method: "select",
+            title: "Color",
+            message: "Pick one",
+            options: ["Red", "Green"],
+            timeout: 0,
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        const requestedEvent = yield* Deferred.make<ProviderEvent>();
+        const resolvedEvent = yield* Deferred.make<ProviderEvent>();
+        const seen: Array<ProviderEvent> = [];
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          Effect.gen(function* () {
+            seen.push(event);
+            if (event.method === "user-input/requested") {
+              yield* Deferred.succeed(requestedEvent, event);
+            }
+            if (event.method === "user-input/resolved") {
+              yield* Deferred.succeed(resolvedEvent, event);
+            }
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* runtime.sendTurn({ text: "ask" });
+        // One consumer owns the stream for the full dialog round trip. This
+        // avoids losing the resolved event when a second fromQueue consumer is
+        // started after the requested event has already been drained.
+        const requested = [yield* Deferred.await(requestedEvent)];
+        const question = requested.find((event) => event.method === "user-input/requested");
+        NodeAssert.deepEqual(payloadOf(question!).questions, [
+          {
+            id: "select-one",
+            header: "Color",
+            question: "Pick one",
+            options: [
+              { label: "Red", description: "Red", value: "Red" },
+              { label: "Green", description: "Green", value: "Green" },
+            ],
+            allowCustomAnswer: false,
+          },
+        ]);
+        yield* runtime.respondToUserInput("select-one" as never, { "select-one": "Green" });
+        const resolved = [yield* Deferred.await(resolvedEvent)];
+        NodeAssert.deepEqual(
+          payloadOf(resolved.find((event) => event.method === "user-input/resolved")!),
+          {
+            answers: { "select-one": "Green" },
+          },
+        );
+        yield* Fiber.interrupt(collector);
+        yield* runtime.close;
+        NodeAssert.deepEqual(harness.received("extension_ui_response"), [
+          { type: "extension_ui_response", id: "select-one", value: "Green" },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("round-trips every Pi dialog shape with exact response frames", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "select",
+            method: "select",
+            title: "Pick",
+            message: "Color?",
+            options: ["Red", "Green"],
+            timeout: 0,
+          },
+          {
+            type: "extension_ui_request",
+            id: "confirm-yes",
+            method: "confirm",
+            title: "Proceed",
+            message: "Continue?",
+          },
+          {
+            type: "extension_ui_request",
+            id: "confirm-no",
+            method: "confirm",
+            title: "Proceed",
+            message: "Continue?",
+          },
+          {
+            type: "extension_ui_request",
+            id: "input",
+            method: "input",
+            title: "Name",
+            message: "Your name",
+            placeholder: "Ada",
+          },
+          {
+            type: "extension_ui_request",
+            id: "editor",
+            method: "editor",
+            title: "Body",
+            message: "Edit",
+            prefill: "initial text",
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        const requests = yield* Queue.unbounded<ProviderEvent>();
+        const resolved = yield* Queue.unbounded<ProviderEvent>();
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          Effect.gen(function* () {
+            if (event.method === "user-input/requested") yield* Queue.offer(requests, event);
+            if (event.method === "user-input/resolved") yield* Queue.offer(resolved, event);
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* runtime.sendTurn({ text: "dialogs" });
+
+        const select = yield* Queue.take(requests);
+        NodeAssert.deepEqual(questionOf(select), {
+          id: "select",
+          header: "Pick",
+          question: "Color?",
+          options: [
+            { label: "Red", description: "Red", value: "Red" },
+            { label: "Green", description: "Green", value: "Green" },
+          ],
+          allowCustomAnswer: false,
+        });
+        yield* runtime.respondToUserInput(select.requestId!, { select: "Green" });
+        NodeAssert.deepEqual(payloadOf(yield* Queue.take(resolved)).answers, { select: "Green" });
+
+        const yes = yield* Queue.take(requests);
+        NodeAssert.deepEqual(questionOf(yes).options, [
+          { label: "Confirm", description: "Confirm", value: "true" },
+          { label: "Cancel", description: "Cancel", value: "false" },
+        ]);
+        yield* runtime.respondToUserInput(yes.requestId!, { "confirm-yes": true });
+        NodeAssert.deepEqual(payloadOf(yield* Queue.take(resolved)).answers, {
+          "confirm-yes": true,
+        });
+
+        const no = yield* Queue.take(requests);
+        yield* runtime.respondToUserInput(no.requestId!, { "confirm-no": false });
+        NodeAssert.deepEqual(payloadOf(yield* Queue.take(resolved)).answers, {
+          "confirm-no": false,
+        });
+
+        const input = yield* Queue.take(requests);
+        NodeAssert.deepEqual(questionOf(input), {
+          id: "input",
+          header: "Name",
+          question: "Your name",
+          options: [],
+          placeholder: "Ada",
+          allowCustomAnswer: true,
+        });
+        yield* runtime.respondToUserInput(input.requestId!, { input: "Grace" });
+        yield* Queue.take(resolved);
+
+        const editor = yield* Queue.take(requests);
+        NodeAssert.deepEqual(questionOf(editor), {
+          id: "editor",
+          header: "Body",
+          question: "Edit",
+          options: [],
+          initialValue: "initial text",
+          allowCustomAnswer: true,
+        });
+        yield* runtime.respondToUserInput(editor.requestId!, { editor: "initial text" });
+        yield* Queue.take(resolved);
+        yield* Fiber.interrupt(collector);
+        yield* runtime.close;
+        NodeAssert.deepEqual(harness.received("extension_ui_response"), [
+          { type: "extension_ui_response", id: "select", value: "Green" },
+          { type: "extension_ui_response", id: "confirm-yes", confirmed: true },
+          { type: "extension_ui_response", id: "confirm-no", confirmed: false },
+          { type: "extension_ui_response", id: "input", value: "Grace" },
+          { type: "extension_ui_response", id: "editor", value: "initial text" },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "self-resolves timed-out dialogs without writing, while timeout zero stays pending",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const eventsPath = writeJsonl([
+            {
+              type: "extension_ui_request",
+              id: "timed",
+              method: "input",
+              title: "Input",
+              message: "Value",
+              timeout: 1000,
+            },
+            {
+              type: "extension_ui_request",
+              id: "pending",
+              method: "input",
+              title: "Input",
+              message: "Value",
+              timeout: 0,
+            },
+          ]);
+          const harness = makeFakeCli({
+            responses: {
+              get_state: { success: true, data: getStateData() },
+              prompt: { success: true },
+            },
+            events: eventsPath,
+          });
+          const runtime = yield* startRuntime(harness);
+          const requests = yield* Queue.unbounded<ProviderEvent>();
+          const resolved = yield* Queue.unbounded<ProviderEvent>();
+          const collector = yield* Stream.runForEach(runtime.events, (event) =>
+            Effect.gen(function* () {
+              if (event.method === "user-input/requested") yield* Queue.offer(requests, event);
+              if (event.method === "user-input/resolved") yield* Queue.offer(resolved, event);
+            }),
+          ).pipe(Effect.forkScoped);
+          yield* runtime.sendTurn({ text: "timeout" });
+          const timed = yield* Queue.take(requests);
+          yield* TestClock.adjust(Duration.seconds(1));
+          NodeAssert.deepEqual(payloadOf(yield* Queue.take(resolved)).answers, { timed: null });
+          const pending = yield* Queue.take(requests);
+          // A zero timeout is explicitly disabled; it remains pending until a
+          // response or teardown claims it.
+          yield* runtime.respondToUserInput(pending.requestId!, { pending: "kept" });
+          NodeAssert.deepEqual(payloadOf(yield* Queue.take(resolved)).answers, { pending: "kept" });
+          yield* Fiber.interrupt(collector);
+          yield* runtime.close;
+          NodeAssert.deepEqual(harness.received("extension_ui_response"), [
+            { type: "extension_ui_response", id: "pending", value: "kept" },
+          ]);
+        }),
+      ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("cancels pending dialogs on close exactly once", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "close-me",
+            method: "select",
+            title: "Pick",
+            message: "Pick",
+            options: ["A"],
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        const requested = yield* Deferred.make<ProviderEvent>();
+        const resolved = yield* Deferred.make<ProviderEvent>();
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          event.method === "user-input/requested"
+            ? Deferred.succeed(requested, event)
+            : event.method === "user-input/resolved"
+              ? Deferred.succeed(resolved, event)
+              : Effect.void,
+        ).pipe(Effect.forkScoped);
+        yield* runtime.sendTurn({ text: "close" });
+        const request = yield* Deferred.await(requested);
+        yield* runtime.close;
+        NodeAssert.deepEqual(payloadOf(yield* Deferred.await(resolved)).answers, {
+          "close-me": null,
+        });
+        NodeAssert.deepEqual(harness.received("extension_ui_response"), [
+          { type: "extension_ui_response", id: "close-me", cancelled: true },
+        ]);
+        yield* Fiber.interrupt(collector);
+        void request;
+      }),
+    ),
+  );
+
+  it.effect("cancels malformed and unsupported extension dialogs with warnings", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "bad",
+            method: "select",
+            title: "Empty",
+            message: "Pick",
+            options: [],
+          },
+          { type: "extension_ui_request", id: "future", method: "future_dialog", title: "Future" },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        const queue = yield* Queue.unbounded<ProviderEvent>();
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          Queue.offer(queue, event),
+        ).pipe(Effect.forkScoped);
+        yield* runtime.sendTurn({ text: "bad dialogs" });
+        const seen: Array<ProviderEvent> = [];
+        // Both requests are handled synchronously by the frame fiber; drain
+        // until the two warnings have been observed.
+        while (seen.filter((event) => event.method === "runtime/warning").length < 2) {
+          seen.push(yield* Queue.take(queue));
+        }
+        NodeAssert.equal(seen.filter((event) => event.method === "runtime/warning").length, 2);
+        yield* Fiber.interrupt(collector);
+        yield* runtime.close;
+        NodeAssert.deepEqual(harness.received("extension_ui_response"), [
+          { type: "extension_ui_response", id: "bad", cancelled: true },
+          { type: "extension_ui_response", id: "future", cancelled: true },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("cancels a pending dialog when the Pi process exits", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "exit-me",
+            method: "input",
+            title: "Input",
+            message: "Value",
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+          // The peer emits the blocking request and then exits without waiting
+          // for the extension_ui_response.
+          exitAfter: ["prompt"],
+        });
+        const runtime = yield* startRuntime(harness);
+        const requested = yield* Deferred.make<ProviderEvent>();
+        const resolved = yield* Deferred.make<ProviderEvent>();
+        const exited = yield* Deferred.make<ProviderEvent>();
+        const seen: Array<ProviderEvent> = [];
+        // One consumer owns the stream through process-exit teardown. In
+        // particular, this keeps the cancellation and session terminal events
+        // in the same FIFO observation as the request.
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          Effect.gen(function* () {
+            seen.push(event);
+            if (event.method === "user-input/requested") {
+              yield* Deferred.succeed(requested, event);
+            } else if (event.method === "user-input/resolved") {
+              yield* Deferred.succeed(resolved, event);
+            } else if (event.method === "session/exited") {
+              yield* Deferred.succeed(exited, event);
+            }
+          }),
+        ).pipe(Effect.forkScoped);
+
+        // Keep the prompt request in flight: the peer exits immediately after
+        // emitting the dialog, so there is intentionally no successful prompt
+        // lifecycle to await here.
+        yield* runtime.sendTurn({ text: "exit while asking" }).pipe(Effect.forkScoped);
+        const request = yield* Deferred.await(requested);
+        const sessionExited = yield* Deferred.await(exited);
+        const cancellation = yield* Deferred.await(resolved);
+        NodeAssert.deepEqual(payloadOf(cancellation).answers, { "exit-me": null });
+        NodeAssert.equal(seen.filter((event) => event.method === "user-input/resolved").length, 1);
+        NodeAssert.equal(seen.filter((event) => event.method === "session/exited").length, 1);
+        const terminalMethods = seen
+          .filter((event) =>
+            ["turn/aborted", "user-input/resolved", "session/exited"].includes(event.method),
+          )
+          .map((event) => event.method);
+        NodeAssert.deepEqual(terminalMethods, [
+          "turn/aborted",
+          "user-input/resolved",
+          "session/exited",
+        ]);
+
+        // The client can race with the exit notification, but its late answer
+        // must not claim the already-cancelled dialog or write to dead Pi.
+        const late = yield* runtime
+          .respondToUserInput(request.requestId!, { "exit-me": "late" })
+          .pipe(Effect.exit);
+        NodeAssert.equal(late._tag, "Failure");
+        NodeAssert.equal(harness.received("extension_ui_response").length, 0);
+        yield* Fiber.join(collector);
+        void sessionExited;
+      }),
+    ),
+  );
+
+  it.effect("wins the response/close race exactly once", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const eventsPath = writeJsonl([
+          {
+            type: "extension_ui_request",
+            id: "race",
+            method: "input",
+            title: "Race",
+            message: "Value",
+          },
+        ]);
+        const harness = makeFakeCli({
+          responses: {
+            get_state: { success: true, data: getStateData() },
+            prompt: { success: true },
+          },
+          events: eventsPath,
+        });
+        const runtime = yield* startRuntime(harness);
+        const requested = yield* Deferred.make<ProviderEvent>();
+        const resolved = yield* Queue.unbounded<ProviderEvent>();
+        const collector = yield* Stream.runForEach(runtime.events, (event) =>
+          event.method === "user-input/requested"
+            ? Deferred.succeed(requested, event)
+            : event.method === "user-input/resolved"
+              ? Queue.offer(resolved, event)
+              : Effect.void,
+        ).pipe(Effect.forkScoped);
+        yield* runtime.sendTurn({ text: "race" });
+        const request = yield* Deferred.await(requested);
+        yield* Effect.all(
+          [
+            runtime.respondToUserInput(request.requestId!, { race: "answer" }).pipe(Effect.ignore),
+            runtime.close,
+          ],
+          { concurrency: "unbounded" },
+        );
+        const event = yield* Queue.take(resolved);
+        NodeAssert.deepEqual(payloadOf(event).answers, { race: "answer" });
+        yield* Fiber.interrupt(collector);
+        NodeAssert.equal(harness.received("extension_ui_response").length, 1);
       }),
     ),
   );

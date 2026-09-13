@@ -104,6 +104,9 @@ const handleLine = (line) => {
     for (const event of replayLines) process.stdout.write(`${event}\n`);
   }
   if (respondAfterEvents) respond(frame.id, command, result);
+  if ((script.exitAfter ?? []).includes(command)) {
+    process.exit(0);
+  }
 };
 
 process.stdin.on("data", (chunk) => {

@@ -39,6 +39,7 @@ export function QuestionAttachments(props: {
   value: string;
   onChangeText: (value: string) => void;
   onInputFocusChange?: ((focused: boolean) => void) | undefined;
+  placeholder?: string;
 }) {
   const { selectedThread } = useThreadSelection();
   const navigation = useNavigation();
@@ -197,7 +198,7 @@ export function QuestionAttachments(props: {
           onChangeText={props.onChangeText}
           onFocus={() => props.onInputFocusChange?.(true)}
           onBlur={() => props.onInputFocusChange?.(false)}
-          placeholder="Or type a custom answer"
+          placeholder={props.placeholder ?? "Or type a custom answer"}
           className="min-h-[54px] rounded-2xl border border-input-border bg-input px-3.5 py-3 font-sans text-base text-foreground"
         />
       </TextInputWrapper>

@@ -13,6 +13,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeItemId,
+  RuntimeRequestId,
   RuntimeTaskId,
   TurnId,
   isToolLifecycleItemType,
@@ -445,6 +446,34 @@ export const mapPiEventToRuntimeEvents = (
           payload: { state: "compacted" },
         },
       ];
+    case "user-input/requested": {
+      const payload = (event.payload ?? {}) as { readonly questions?: unknown };
+      if (!Array.isArray(payload.questions)) return [];
+      return [
+        {
+          ...base,
+          type: "user-input.requested",
+          ...(event.requestId !== undefined
+            ? { requestId: RuntimeRequestId.make(event.requestId) }
+            : {}),
+          payload: { questions: payload.questions },
+        },
+      ];
+    }
+    case "user-input/resolved": {
+      const payload = (event.payload ?? {}) as { readonly answers?: unknown };
+      if (typeof payload.answers !== "object" || payload.answers === null) return [];
+      return [
+        {
+          ...base,
+          type: "user-input.resolved",
+          ...(event.requestId !== undefined
+            ? { requestId: RuntimeRequestId.make(event.requestId) }
+            : {}),
+          payload: { answers: payload.answers as Readonly<Record<string, unknown>> },
+        },
+      ];
+    }
     case "runtime/warning": {
       const message = event.message ?? "Pi reported a warning.";
       return [
@@ -523,13 +552,23 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       context.stopped = true;
       sessions.delete(context.threadId);
       yield* context.runtime.close.pipe(Effect.ignore);
+      // Runtime.close shuts the source queue after terminal events. Joining is
+      // the delivery acknowledgement: all mapped events are offered before the
+      // session scope and adapter consumer are torn down.
+      yield* Fiber.join(context.eventFiber).pipe(Effect.ignore);
       yield* Effect.ignore(Scope.close(context.scope, Exit.void));
-      yield* Fiber.interrupt(context.eventFiber).pipe(Effect.ignore);
     });
 
   const startSession: PiAdapterShape["startSession"] = (input) =>
     Effect.scoped(
       Effect.gen(function* () {
+        if (input.runtimeMode !== "full-access") {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: `Pi currently supports full-access only. Change this thread to full-access or disable Pi before starting a session.`,
+          });
+        }
         if (input.provider !== undefined && input.provider !== PROVIDER) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -601,25 +640,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         sessions.set(input.threadId, context);
         sessionScopeTransferred = true;
 
-        const session = yield* runtime.getSession;
-        if (input.runtimeMode !== "full-access") {
-          // Pi's RPC surface has no approval channel, so T3 cannot enforce a
-          // stricter mode here. Saying so beats a toggle that silently does nothing.
-          yield* offerRuntimeEvent({
-            type: "config.warning",
-            eventId: yield* makeEventId(input.threadId),
-            provider: PROVIDER,
-            providerInstanceId: boundInstanceId,
-            threadId: input.threadId,
-            createdAt: session.updatedAt,
-            payload: {
-              summary: `Runtime mode '${input.runtimeMode}' is not enforced for Pi`,
-              details:
-                "Pi has no per-tool approval channel in this build, so tools run unattended. Configure Pi's own settings for stricter behaviour, or switch this thread to full access.",
-            },
-          });
-        }
-        return session;
+        return yield* runtime.getSession;
       }),
     );
 
@@ -726,22 +747,19 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       }),
     );
 
-  const respondToUserInput: PiAdapterShape["respondToUserInput"] = (_threadId, requestId) =>
-    Effect.fail(
-      new ProviderAdapterRequestError({
-        provider: PROVIDER,
-        method: `user-input/${requestId}`,
-        detail: "Pi does not issue structured user-input requests in this build.",
-      }),
-    );
+  const respondToUserInput: PiAdapterShape["respondToUserInput"] = (threadId, requestId, answers) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      yield* context.runtime.respondToUserInput(requestId, answers);
+    }).pipe(Effect.mapError((cause) => toAdapterError(threadId, "respondToUserInput", cause)));
 
   const stopSession: PiAdapterShape["stopSession"] = (threadId) =>
     Effect.gen(function* () {
       const context = sessions.get(threadId);
       if (!context) return;
       const session = yield* context.runtime.getSession.pipe(Effect.orElseSucceed(() => undefined));
-      // Tell the UI before tearing the runtime down: after `close` the queue is
-      // shut, so an exit event emitted then would never be drained.
+      yield* stopSessionInternal(context);
+      // Exit follows the runtime's dialog/task resolutions.
       yield* offerRuntimeEvent({
         type: "session.exited",
         eventId: yield* makeEventId(threadId),
@@ -751,7 +769,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         createdAt: session?.updatedAt ?? DateTime.formatIso(yield* DateTime.now),
         payload: { reason: "Stopped by user.", recoverable: true, exitKind: "graceful" },
       });
-      yield* stopSessionInternal(context);
     });
 
   const listSessions: PiAdapterShape["listSessions"] = () =>

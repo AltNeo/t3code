@@ -537,6 +537,10 @@ export const UserInputQuestion = Schema.Struct({
   question: TrimmedNonEmptyStringSchema,
   options: Schema.Array(UserInputQuestionOption),
   allowCustomAnswer: Schema.optional(Schema.Boolean),
+  /** Provider-supplied text used to seed an editable answer. */
+  initialValue: Schema.optional(Schema.String),
+  /** Provider hint shown when the editable answer is empty. */
+  placeholder: Schema.optional(Schema.String),
   multiSelect: Schema.optional(Schema.Boolean).pipe(
     Schema.withConstructorDefault(Effect.succeed(false)),
   ),

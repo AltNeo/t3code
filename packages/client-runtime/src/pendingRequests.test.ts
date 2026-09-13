@@ -265,6 +265,36 @@ describe("pending questions", () => {
     expect(derivePendingRequests([requested]).userInputs[0]?.questions).toEqual([question]);
   });
 
+  it("preserves optional initial values and placeholders", () => {
+    const prefilled = {
+      id: "name",
+      header: "Name",
+      question: "What is your name?",
+      options: [],
+      allowCustomAnswer: true,
+      initialValue: "Ada",
+      placeholder: "Enter a name",
+    };
+    const plain = {
+      id: "plain",
+      header: "Plain",
+      question: "Choose one",
+      options: [{ label: "One", description: "" }],
+    };
+    const userInputs = derivePendingRequests([
+      makeActivity({
+        kind: "user-input.requested",
+        payload: { requestId: "prefill", questions: [prefilled, plain] },
+      }),
+    ]).userInputs;
+    expect(userInputs[0]?.questions).toEqual([
+      { ...prefilled, multiSelect: false },
+      { ...plain, multiSelect: false },
+    ]);
+    expect(userInputs[0]?.questions[1]).not.toHaveProperty("initialValue");
+    expect(userInputs[0]?.questions[1]).not.toHaveProperty("placeholder");
+  });
+
   it("keeps free-text questions without suggested answers", () => {
     const question = {
       id: "0",

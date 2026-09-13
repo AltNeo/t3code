@@ -311,11 +311,12 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
                 question={question}
                 questions={props.pendingUserInput.questions}
                 disabled={props.respondingUserInputId === props.pendingUserInput.requestId}
-                value={draft?.customAnswer ?? ""}
+                value={draft?.customAnswer ?? question.initialValue ?? ""}
                 onChangeText={(value) =>
                   props.onChangeCustomAnswer(props.pendingUserInput.requestId, question.id, value)
                 }
                 onInputFocusChange={props.onInputFocusChange}
+                placeholder={question.placeholder}
               />
             </View>
           );
