@@ -1,24 +1,29 @@
 diff --git a/build/Widgets.types.d.ts b/build/Widgets.types.d.ts
-index 15e026868625ce20a3e359e5cc8e5c7e937c4650..dec7371d74e4f36998a1a170e4fc6557c0962b86 100644
+index 15e026868625ce20a3e359e5cc8e5c7e937c4650..f5cc83174ede4fb6e01cbce494f61e088eb4eed8 100644
 --- a/build/Widgets.types.d.ts
 +++ b/build/Widgets.types.d.ts
-@@ -90,6 +90,8 @@ export type LiveActivityEnvironment = {
+@@ -90,6 +90,10 @@ export type LiveActivityEnvironment = {
       * The color scheme of the activity's environment.
       */
      colorScheme: 'light' | 'dark';
 +    /** The rendering mode supplied by WidgetKit for this presentation. */
 +    widgetRenderingMode?: WidgetRenderingMode;
++    /** Whether the presentation OS supports Liquid Glass. @platform iOS 26+ */
++    isLiquidGlassAvailable?: boolean;
      /**
       * Whether the activity is displayed in a context with reduced luminance.
       * @platform iOS 16+
 diff --git a/ios/Widgets/Utils.swift b/ios/Widgets/Utils.swift
-index 2b4c044b597de7e0fab42dbc47af14d8bb521838..8ca92fdf4c15b0d4e217556da7e1aa0345662c79 100644
+index 2b4c044b597de7e0fab42dbc47af14d8bb521838..801f0aed65ea2659f221d477dd841787d9146c26 100644
 --- a/ios/Widgets/Utils.swift
 +++ b/ios/Widgets/Utils.swift
-@@ -91,6 +91,7 @@ func getLiveActivityEnvironment(for environment: EnvironmentValues, in context:
+@@ -91,6 +91,10 @@ func getLiveActivityEnvironment(for environment: EnvironmentValues, in context:
      "colorScheme": "\(environment.colorScheme)"
    ]
  
++  if #available(iOS 26.0, *) {
++    env["isLiquidGlassAvailable"] = true
++  }
 +  env["widgetRenderingMode"] = environment.widgetRenderingMode.description
    env["isLuminanceReduced"] = environment.isLuminanceReduced
    env["isActivityFullscreen"] = environment.isActivityFullscreen
@@ -127,15 +132,17 @@ index 24d4571a52d3ebe9d785b5d049d8e134a149d513..7051c23b17ac91552e5b5c54606c5708
        LiveActivityBanner(context: context, nodes: nodes)
      } else if let node = nodes["banner"] as? [String: Any] {
 diff --git a/src/Widgets.types.ts b/src/Widgets.types.ts
-index fee5c7475b52218fa0e192a1d347dd32cb0fe1f8..82bf68f631d3a5689064b5acc559d1fc5b4aef85 100644
+index fee5c7475b52218fa0e192a1d347dd32cb0fe1f8..1d3a097b45d8eb5d13e5cedd26f0414caa83a5d6 100644
 --- a/src/Widgets.types.ts
 +++ b/src/Widgets.types.ts
-@@ -104,6 +104,8 @@ export type LiveActivityEnvironment = {
+@@ -104,6 +104,10 @@ export type LiveActivityEnvironment = {
     * The color scheme of the activity's environment.
     */
    colorScheme: 'light' | 'dark';
 +  /** The rendering mode supplied by WidgetKit for this presentation. */
 +  widgetRenderingMode?: WidgetRenderingMode;
++  /** Whether the presentation OS supports Liquid Glass. @platform iOS 26+ */
++  isLiquidGlassAvailable?: boolean;
    /**
     * Whether the activity is displayed in a context with reduced luminance.
     * @platform iOS 16+

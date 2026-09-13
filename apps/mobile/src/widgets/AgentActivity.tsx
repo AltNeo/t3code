@@ -1,6 +1,7 @@
 import { HStack, Image, Spacer, Text, VStack, ZStack } from "@expo/ui/swift-ui";
 import type { ComponentProps } from "react";
 import {
+  activityBackgroundTint,
   font,
   foregroundStyle,
   frame,
@@ -242,7 +243,12 @@ export function AgentActivity(
       <VStack
         alignment="leading"
         spacing={6}
-        modifiers={deepLink ? [padding({ all: 14 }), widgetURL(deepLink)] : [padding({ all: 14 })]}
+        modifiers={[
+          padding({ all: 14 }),
+          // A clear tint reveals iOS 26's glass material; older hosts keep the standard surface.
+          activityBackgroundTint(environment.isLiquidGlassAvailable ? "clear" : null),
+          ...(deepLink ? [widgetURL(deepLink)] : []),
+        ]}
       >
         {/* Logo pinned to the leading edge; the status texts centered across the
             full width (ZStack so the logo doesn't skew the centering). No footer —
