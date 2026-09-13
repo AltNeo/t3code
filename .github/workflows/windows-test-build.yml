@@ -10,10 +10,59 @@ permissions:
   contents: read
 
 jobs:
+  build-wsl-node-pty:
+    name: Build WSL node-pty (linux-x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/pi-provider
+          fetch-depth: 0
+
+      - name: Merge latest upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+          git -c user.name=t3-ci -c user.email=t3-ci@users.noreply.github.com merge --no-commit --no-ff upstream/main
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Build node-pty linux-x64 prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload node-pty prebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+
   build:
     name: Build Windows installer
+    needs: build-wsl-node-pty
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout feature branch
@@ -50,6 +99,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild
+
       - name: Build unsigned installer
         shell: pwsh
         run: >-
@@ -57,6 +112,7 @@ jobs:
           --platform win
           --target nsis
           --arch x64
+          --wsl-prebuild "${{ github.workspace }}\wsl-prebuild\pty.node"
           --build-version 0.0.41-test.${{ github.run_number }}
           --verbose
 
