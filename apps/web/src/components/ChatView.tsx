@@ -8398,17 +8398,14 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
 
-  // "Work locally" on the setup card: flip the draft to local mode and cancel
-  // the bootstrap. The cancelled dispatch fails and puts the message back in
-  // the composer; the effect below resends it once that has settled.
+  // "Work locally" on the setup card: cancel the bootstrap and remember the
+  // draft. The cancelled dispatch deletes the half-made thread and puts the
+  // message back in the composer; the effect below then flips the draft to
+  // local mode and resends. The draft is a server thread for the whole
+  // setup (the bootstrap created it), so this keys off the route, not
+  // `isLocalDraftThread`.
   const onWorktreeSetupWorkLocally = useCallback(() => {
-    if (
-      !worktreeSetup ||
-      !worktreeSetupRef ||
-      worktreeSetup.phase !== "running" ||
-      !isLocalDraftThread ||
-      !draftId
-    ) {
+    if (!worktreeSetup || !worktreeSetupRef || worktreeSetup.phase !== "running" || !draftId) {
       return;
     }
     const target = {
@@ -8418,17 +8415,9 @@ export default function ChatView(props: ChatViewProps) {
     void (async () => {
       const result = await cancelWorktreeSetup(target);
       if (result._tag !== "Success" || !result.value.cancelled) return;
-      onEnvModeChange("local");
       setWorkLocallyResendDraftId(draftId);
     })();
-  }, [
-    cancelWorktreeSetup,
-    draftId,
-    isLocalDraftThread,
-    onEnvModeChange,
-    worktreeSetup,
-    worktreeSetupRef,
-  ]);
+  }, [cancelWorktreeSetup, draftId, worktreeSetup, worktreeSetupRef]);
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
   // Resend once the cancelled dispatch has settled and the composer is free.
@@ -8439,7 +8428,7 @@ export default function ChatView(props: ChatViewProps) {
   const workLocallyResendReady =
     workLocallyResendDraftId !== null &&
     workLocallyResendDraftId === draftId &&
-    activeThread !== null &&
+    isLocalDraftThread &&
     !isSendBusy &&
     !isConnecting &&
     !isRevertingCheckpoint &&
@@ -8448,8 +8437,7 @@ export default function ChatView(props: ChatViewProps) {
     !needsLoadBalancing &&
     !activeEnvironmentUnavailable &&
     !activePendingProgress &&
-    !feedbackUploading &&
-    sendEnvMode === "local";
+    !feedbackUploading;
   useEffect(() => {
     if (
       !workLocallyResendReady ||
@@ -8458,9 +8446,21 @@ export default function ChatView(props: ChatViewProps) {
     ) {
       return;
     }
+    if (sendEnvMode !== "local") {
+      // The draft is back; switch it to the project checkout and let the next
+      // render resend.
+      setDraftThreadContext(composerDraftTarget, { envMode: "local", startFromOrigin: false });
+      return;
+    }
     setWorkLocallyResendDraftId(null);
     void onSendRef.current();
-  }, [routeThreadKey, workLocallyResendReady]);
+  }, [
+    composerDraftTarget,
+    routeThreadKey,
+    sendEnvMode,
+    setDraftThreadContext,
+    workLocallyResendReady,
+  ]);
 
   const onStartFromOriginChange = (nextStartFromOrigin: boolean) => {
     if (canOverrideServerThreadEnvMode && activeThread) {
@@ -8907,7 +8907,7 @@ export default function ChatView(props: ChatViewProps) {
                 activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
                 worktreeSetup={paintOnlyDisplayedTimeline ? null : worktreeSetup}
                 onCancelWorktreeSetup={onCancelWorktreeSetup}
-                {...(isLocalDraftThread ? { onWorktreeSetupWorkLocally } : {})}
+                {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
