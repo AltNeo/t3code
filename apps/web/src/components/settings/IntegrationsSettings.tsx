@@ -14,7 +14,6 @@ import {
   type BrowserLinkTarget,
   type BrowserProfile,
   type EnvironmentId,
-  type SshDeviceHostConfig,
   BROWSER_PROFILE_NAME_MAX_LENGTH,
   BROWSER_RECORDING_FRAME_RATES,
   DEFAULT_BROWSER_AUTO_SHOW_FLOATING_PREVIEW,
@@ -577,7 +576,6 @@ function DeviceIntegrationSettings() {
       <DeviceIntegrationControls
         key={`${environmentId}:${JSON.stringify(search)}`}
         environmentId={environmentId}
-        hosts={selected?.serverConfig?.settings.deviceHosts ?? []}
         enabled={settings.enableDeviceSupport}
         agentAccessEnabled={settings.enableAgentDeviceAccess}
       />
@@ -587,12 +585,10 @@ function DeviceIntegrationSettings() {
 
 function DeviceIntegrationControls({
   environmentId,
-  hosts,
   enabled,
   agentAccessEnabled,
 }: {
   environmentId: EnvironmentId | null;
-  hosts: ReadonlyArray<SshDeviceHostConfig>;
   enabled: boolean;
   agentAccessEnabled: boolean;
 }) {
@@ -603,7 +599,7 @@ function DeviceIntegrationControls({
   const anyHubEnabled = connectedEnvironments.some(
     (environment) => environment.serverConfig?.settings.enableDeviceSupport,
   );
-  const configure = useAtomCommand(deviceEnvironment.configure);
+  const configure = useAtomCommand(deviceEnvironment.configure, { reportFailure: false });
   const list = useAtomCommand(deviceEnvironment.list, { reportFailure: false });
   const [pending, setPending] = useState<"hub" | "check" | "agent" | null>(null);
   const busy = state.hostStatus === "installing" || state.hostStatus === "starting";
@@ -738,7 +734,7 @@ function DeviceIntegrationControls({
           {state.hostStatusDetail}
         </p>
       ) : null}
-      <DeviceHostsSettings environmentId={environmentId} hosts={hosts} />
+      <DeviceHostsSettings environmentId={environmentId} />
     </>
   );
 }

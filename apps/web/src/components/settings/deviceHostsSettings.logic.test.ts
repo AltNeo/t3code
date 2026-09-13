@@ -20,4 +20,24 @@ describe("device host changes across environments", () => {
     expect(saved).toEqual([[edited], [local, edited]]);
     expect(saved.map((hosts) => updateDeviceHosts(hosts, edited, true))).toEqual([[], [local]]);
   });
+
+  it("recognizes a host added separately on another environment and preserves its local ID", () => {
+    const remote = { ...shared, id: "remote-id" };
+    const edited = { ...shared, target: "julius@new-address" };
+    expect(updateDeviceHosts([remote, local], shared, false)).toEqual([remote, local]);
+    const saved = updateDeviceHosts([remote, local], edited, false, shared);
+    expect(saved).toEqual([{ ...edited, id: remote.id }, local]);
+    expect(updateDeviceHosts(saved, edited, false, shared)).toEqual(saved);
+    expect(updateDeviceHosts([remote, local], shared, true)).toEqual([local]);
+  });
+
+  it("keeps distinct SSH connections to the same target separate", () => {
+    const anotherPort = { ...shared, id: "another-port", port: 2222 };
+    const anotherIdentity = { ...shared, id: "another-key", identityFile: "~/.ssh/another" };
+    expect(updateDeviceHosts([anotherPort, anotherIdentity], shared, false)).toEqual([
+      anotherPort,
+      anotherIdentity,
+      shared,
+    ]);
+  });
 });

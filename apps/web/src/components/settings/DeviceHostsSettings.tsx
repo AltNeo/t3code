@@ -23,28 +23,17 @@ import { useSettingsScope } from "./SettingsScopeContext";
 import { toastManager } from "../ui/toast";
 import { updateDeviceHosts } from "./deviceHostsSettings.logic";
 
-export function DeviceHostsSettings(props: {
-  environmentId: EnvironmentId | null;
-  hosts: ReadonlyArray<SshDeviceHostConfig>;
-}) {
-  const { scope, environments } = useSettingsScope();
+export function DeviceHostsSettings(props: { environmentId: EnvironmentId | null }) {
+  const { scope, environments, connectedEnvironments, environment: selected } = useSettingsScope();
   const projectScope = scope.kind === "project" || scope.kind === "checkout";
-  const update = useAtomCommand(serverEnvironment.updateSettings);
-  const test = useAtomCommand(deviceEnvironment.testHost, { reportFailure: false });
-  const { state } = useDeviceState(props.environmentId);
+  const update = useAtomCommand(serverEnvironment.updateSettings, { reportFailure: false });
   const [editing, setEditing] = useState<SshDeviceHostConfig | null>(null);
+  const [originalHost, setOriginalHost] = useState<SshDeviceHostConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const validPort = (port: number | undefined) =>
     port === undefined || (Number.isInteger(port) && port >= 1 && port <= 65535);
-  const [checks, setChecks] = useState<
-    Record<
-      string,
-      { pending?: boolean; platforms?: ReadonlyArray<DevicePlatformAvailability>; error?: string }
-    >
-  >({});
-  const setCheck = (id: string, value: (typeof checks)[string]) =>
-    setChecks((current) => ({ ...current, [id]: value }));
-  const save = async (host: SshDeviceHostConfig, remove = false) => {
+  const { checks, testConnection } = useHostConnectionChecks(props.environmentId);
+  const save = async (host: SshDeviceHostConfig, remove = false, original = host) => {
     if (!props.environmentId || projectScope) return;
     setBusy(true);
     try {
@@ -61,6 +50,7 @@ export function DeviceHostsSettings(props: {
                   environment.serverConfig.settings.deviceHosts,
                   host,
                   remove,
+                  original,
                 ),
               },
             },
@@ -84,21 +74,6 @@ export function DeviceHostsSettings(props: {
       setBusy(false);
     }
   };
-  const testConnection = async (host: SshDeviceHostConfig) => {
-    if (!props.environmentId || checks[host.id]?.pending) return;
-    setCheck(host.id, { pending: true });
-    try {
-      const summary = await test({ environmentId: props.environmentId, input: host });
-      setCheck(
-        host.id,
-        summary._tag === "Failure"
-          ? { error: Cause.pretty(summary.cause) }
-          : { platforms: summary.value.platforms },
-      );
-    } catch (error) {
-      setCheck(host.id, { error: error instanceof Error ? error.message : String(error) });
-    }
-  };
   return (
     <SettingsRow
       id="device-hosts"
@@ -112,6 +87,7 @@ export function DeviceHostsSettings(props: {
           variant="outline"
           disabled={projectScope || busy || !props.environmentId || editing !== null}
           onClick={() => {
+            setOriginalHost(null);
             setEditing({ id: randomUUID(), label: "", target: "" });
           }}
         >
@@ -126,122 +102,31 @@ export function DeviceHostsSettings(props: {
           </p>
         ) : (
           <>
-            {props.hosts.map((host) => {
-              const status = state.hostStatuses[host.id];
-              const check = checks[host.id];
-              const platforms =
-                check?.platforms ??
-                state.hosts.find((value) => value.id === host.id)?.platforms ??
-                [];
-              const progress = check?.pending
-                ? "Checking connection…"
-                : status?.status === "installing"
-                  ? "Installing device support…"
-                  : status?.status === "starting"
-                    ? "Connecting…"
-                    : null;
-              const error =
-                check?.error ?? (status?.status === "failed" ? status.detail : undefined);
-              return (
-                <div
-                  key={host.id}
-                  className="flex items-center gap-2 border-t border-border/50 py-2.5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <p className="truncate text-sm font-medium">{host.label}</p>
-                      {platforms
-                        .filter((platform) => platform.available)
-                        .map((platform) => (
-                          <Tooltip key={platform.platform}>
-                            <TooltipTrigger
-                              render={
-                                <span
-                                  tabIndex={0}
-                                  role="img"
-                                  aria-label={
-                                    platform.platform === "ios"
-                                      ? "iOS available"
-                                      : "Android available"
-                                  }
-                                  className="shrink-0 text-muted-foreground"
-                                />
-                              }
-                            >
-                              {platform.platform === "ios" ? (
-                                <AppleIcon className="size-3.5" />
-                              ) : (
-                                <AndroidIcon className="size-3.5" />
-                              )}
-                            </TooltipTrigger>
-                            <TooltipPopup>
-                              {platform.platform === "ios" ? "iOS available" : "Android available"}
-                            </TooltipPopup>
-                          </Tooltip>
-                        ))}
-                    </div>
-                    <p className="truncate text-xs text-muted-foreground">{host.target}</p>
-                    {error ? (
-                      <div className="mt-1" role="status">
-                        <details className="text-xs text-destructive">
-                          <summary>Connection failed</summary>
-                          <p className="mt-1 whitespace-pre-wrap break-words">{error}</p>
-                        </details>
-                      </div>
-                    ) : null}
-                  </div>
-                  {progress ? (
-                    <span
-                      role="status"
-                      className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
-                    >
-                      <Spinner className="size-3" />
-                      {progress}
-                    </span>
-                  ) : null}
-                  <Menu>
-                    <MenuTrigger
-                      render={
-                        <Button
-                          size="icon-sm"
-                          variant="ghost-muted"
-                          disabled={projectScope || busy}
-                          aria-label={host.label + " options"}
-                        />
-                      }
-                    >
-                      <MoreVertical />
-                    </MenuTrigger>
-                    <MenuPopup align="end">
-                      <MenuItem
-                        onClick={() => {
-                          setEditing(host);
-                        }}
-                      >
-                        Edit
-                      </MenuItem>
-                      <MenuItem variant="destructive" onClick={() => void save(host, true)}>
-                        Remove
-                      </MenuItem>
-                    </MenuPopup>
-                  </Menu>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy || progress !== null}
-                    onClick={() => void testConnection(host)}
-                  >
-                    Test connection
-                  </Button>
-                </div>
-              );
-            })}
+            {connectedEnvironments.map((environment) => (
+              <div key={environment.environmentId}>
+                {connectedEnvironments.length > 1 ? (
+                  <p className="pt-3 pb-1 text-xs font-medium text-muted-foreground">
+                    {environment.label}
+                  </p>
+                ) : null}
+                <DeviceHostList
+                  environmentId={environment.environmentId}
+                  hosts={environment.serverConfig?.settings.deviceHosts ?? []}
+                  busy={projectScope || busy}
+                  onEdit={(host) => {
+                    setOriginalHost(host);
+                    setEditing(host);
+                  }}
+                  onRemove={(host) => void save(host, true)}
+                />
+              </div>
+            ))}
             {editing ? (
               <form
                 className="space-y-3 border-t border-border/50 py-3"
                 onSubmit={(event) => {
                   event.preventDefault();
-                  void save(editing);
+                  void save(editing, false, originalHost ?? editing);
                 }}
               >
                 <label className="block space-y-1 text-sm">
@@ -320,7 +205,9 @@ export function DeviceHostsSettings(props: {
                     }
                     onClick={() => void testConnection(editing)}
                   >
-                    Test connection
+                    {connectedEnvironments.length > 1
+                      ? `Test from ${selected?.label}`
+                      : "Test connection"}
                   </Button>
                   <Button
                     size="sm"
@@ -357,5 +244,159 @@ export function DeviceHostsSettings(props: {
         )}
       </div>
     </SettingsRow>
+  );
+}
+
+function useHostConnectionChecks(environmentId: EnvironmentId | null) {
+  const test = useAtomCommand(deviceEnvironment.testHost, { reportFailure: false });
+  const [checks, setChecks] = useState<
+    Record<
+      string,
+      { pending?: boolean; platforms?: ReadonlyArray<DevicePlatformAvailability>; error?: string }
+    >
+  >({});
+  const setCheck = (id: string, value: (typeof checks)[string]) =>
+    setChecks((current) => ({ ...current, [id]: value }));
+  const testConnection = async (host: SshDeviceHostConfig) => {
+    if (!environmentId || checks[host.id]?.pending) return;
+    setCheck(host.id, { pending: true });
+    try {
+      const summary = await test({ environmentId: environmentId, input: host });
+      setCheck(
+        host.id,
+        summary._tag === "Failure"
+          ? { error: Cause.pretty(summary.cause) }
+          : { platforms: summary.value.platforms },
+      );
+    } catch (error) {
+      setCheck(host.id, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  return { checks, testConnection };
+}
+
+function DeviceHostList({
+  environmentId,
+  hosts,
+  busy,
+  onEdit,
+  onRemove,
+}: {
+  environmentId: EnvironmentId;
+  hosts: ReadonlyArray<SshDeviceHostConfig>;
+  busy: boolean;
+  onEdit: (host: SshDeviceHostConfig) => void;
+  onRemove: (host: SshDeviceHostConfig) => void;
+}) {
+  const { state } = useDeviceState(environmentId);
+  const { checks, testConnection } = useHostConnectionChecks(environmentId);
+  return (
+    <>
+      {hosts.length === 0 ? (
+        <p className="py-2 text-sm text-muted-foreground">No device hosts.</p>
+      ) : null}
+      {hosts.map((host) => {
+        const status = state.hostStatuses[host.id];
+        const check = checks[host.id];
+        const platforms =
+          check?.platforms ?? state.hosts.find((value) => value.id === host.id)?.platforms ?? [];
+        const progress = check?.pending
+          ? "Checking connection…"
+          : status?.status === "installing"
+            ? "Installing device support…"
+            : status?.status === "starting"
+              ? "Connecting…"
+              : null;
+        const error = check?.error ?? (status?.status === "failed" ? status.detail : undefined);
+        return (
+          <div key={host.id} className="flex items-center gap-2 border-t border-border/50 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <p className="truncate text-sm font-medium">{host.label}</p>
+                {platforms
+                  .filter((platform) => platform.available)
+                  .map((platform) => (
+                    <Tooltip key={platform.platform}>
+                      <TooltipTrigger
+                        render={
+                          <span
+                            tabIndex={0}
+                            role="img"
+                            aria-label={
+                              platform.platform === "ios" ? "iOS available" : "Android available"
+                            }
+                            className="shrink-0 text-muted-foreground"
+                          />
+                        }
+                      >
+                        {platform.platform === "ios" ? (
+                          <AppleIcon className="size-3.5" />
+                        ) : (
+                          <AndroidIcon className="size-3.5" />
+                        )}
+                      </TooltipTrigger>
+                      <TooltipPopup>
+                        {platform.platform === "ios" ? "iOS available" : "Android available"}
+                      </TooltipPopup>
+                    </Tooltip>
+                  ))}
+              </div>
+              <p className="truncate text-xs text-muted-foreground">{host.target}</p>
+              {error ? (
+                <div className="mt-1" role="status">
+                  <details className="text-xs text-destructive">
+                    <summary>Connection failed</summary>
+                    <p className="mt-1 whitespace-pre-wrap break-words">{error}</p>
+                  </details>
+                </div>
+              ) : null}
+            </div>
+            {progress ? (
+              <span
+                role="status"
+                className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
+              >
+                <Spinner className="size-3" />
+                {progress}
+              </span>
+            ) : null}
+            <Menu>
+              <MenuTrigger
+                render={
+                  <Button
+                    size="icon-sm"
+                    variant="ghost-muted"
+                    disabled={busy}
+                    aria-label={host.label + " options"}
+                  />
+                }
+              >
+                <MoreVertical />
+              </MenuTrigger>
+              <MenuPopup align="end">
+                <MenuItem
+                  onClick={() => {
+                    onEdit(host);
+                  }}
+                >
+                  Edit
+                </MenuItem>
+                <MenuItem variant="destructive" onClick={() => onRemove(host)}>
+                  Remove
+                </MenuItem>
+              </MenuPopup>
+            </Menu>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy || progress !== null}
+              onClick={() => void testConnection(host)}
+            >
+              Test connection
+            </Button>
+          </div>
+        );
+      })}
+    </>
   );
 }
