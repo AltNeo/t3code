@@ -252,6 +252,10 @@ export const buildPiModelsFromProbe = (
       {
         slug,
         name: model.name.trim().length > 0 ? model.name : slug,
+        // Pi's catalog aggregates many upstreams, and the same model name can
+        // appear under several (deepseek vs opencode-go). The picker renders
+        // this next to the instance name so identical names stay tellable apart.
+        ...(model.provider.trim().length > 0 ? { subProvider: model.provider.trim() } : {}),
         isCustom: false,
         ...(slug === liveSlug ? { isDefault: true } : {}),
         capabilities: piModelCapabilities(

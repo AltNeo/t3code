@@ -94,6 +94,7 @@ it("maps Pi's advertised models and marks the live one as default", () => {
 
   NodeAssert.equal(models.length, 2);
   NodeAssert.equal(models[0]?.slug, "opencode-go/glm-5.3");
+  NodeAssert.equal(models[0]?.subProvider, "opencode-go");
   NodeAssert.equal(models[0]?.isDefault, true);
   const optionDescriptors = models[0]?.capabilities?.optionDescriptors ?? [];
   NodeAssert.equal(optionDescriptors[0]?.id, "thinkingLevel");
@@ -107,6 +108,28 @@ it("maps Pi's advertised models and marks the live one as default", () => {
   // A name-less model falls back to its slug, and is not the default.
   NodeAssert.equal(models[1]?.name, "anthropic/claude-fable-5");
   NodeAssert.equal(models[1]?.isDefault, undefined);
+});
+
+it("keeps same-named models from different upstreams tellable apart", () => {
+  // Pi aggregates several upstreams, so `DeepSeek V4 Flash` can arrive twice.
+  // Without a sub-provider the picker would render two identical rows.
+  const models = buildPiModelsFromProbe({
+    state: undefined,
+    thinkingLevels: [],
+    commands: [],
+    models: [
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "deepseek" },
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", provider: "opencode-go" },
+    ],
+  });
+
+  NodeAssert.deepEqual(
+    models.map((model) => [model.name, model.subProvider]),
+    [
+      ["DeepSeek V4 Flash", "deepseek"],
+      ["DeepSeek V4 Flash", "opencode-go"],
+    ],
+  );
 });
 
 it("drops the thinking descriptor when a model has no reasoning levels", () => {
