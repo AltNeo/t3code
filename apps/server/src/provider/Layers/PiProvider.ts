@@ -57,9 +57,9 @@ const PI_PRESENTATION = {
 } as const;
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({ optionDescriptors: [] });
-const VERSION_PROBE_TIMEOUT_MS = 4_000;
-const RPC_PROBE_TIMEOUT_MS = 15_000;
-const SKILLS_PROBE_TIMEOUT_MS = 20_000;
+const VERSION_PROBE_TIMEOUT_MS = 12_000;
+const RPC_PROBE_TIMEOUT_MS = 45_000;
+const SKILLS_PROBE_TIMEOUT_MS = 60_000;
 
 /**
  * Pi's own var name for the agent directory. T3 maps a configured directory

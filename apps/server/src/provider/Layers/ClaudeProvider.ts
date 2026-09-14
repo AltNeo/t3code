@@ -169,7 +169,7 @@ function apiProviderAuthMetadata(
 // Bedrock backend and runs the `awsAuthRefresh` credential hook before returning
 // account info. The previous 8s budget expired mid-init, so the probe returned
 // `undefined` and left the provider unverified and unselectable in the picker.
-const CAPABILITIES_PROBE_TIMEOUT_MS = 25_000;
+const CAPABILITIES_PROBE_TIMEOUT_MS = 60_000;
 
 /**
  * Keep workspace-scoped command discovery intact while isolating the periodic

@@ -24,7 +24,7 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import { spawnAndCollect } from "../providerSnapshot.ts";
 
-const GROK_SKILLS_PROBE_TIMEOUT_MS = 4_000;
+const GROK_SKILLS_PROBE_TIMEOUT_MS = 12_000;
 
 class GrokSkillsProbeError extends Schema.TaggedError<GrokSkillsProbeError>()(
   "GrokSkillsProbeError",

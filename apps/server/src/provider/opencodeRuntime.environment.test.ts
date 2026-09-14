@@ -154,7 +154,7 @@ describe("verifyOpenCodeServerVersion", () => {
 
       yield* Effect.yieldNow;
       expect(requestSignal).toBeDefined();
-      yield* TestClock.adjust("6 seconds");
+      yield* TestClock.adjust("16 seconds");
 
       const error = yield* Fiber.join(checkFiber);
       expect(error.detail).toBe("Timed out while checking the OpenCode server version.");

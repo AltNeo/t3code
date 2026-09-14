@@ -39,7 +39,7 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonStri
 const OPENCODE_EMPTY_CONFIG_CONTENT = "{}";
 
 export const MINIMUM_OPENCODE_VERSION = "1.14.19";
-const OPENCODE_HEALTH_TIMEOUT = "5 seconds";
+const OPENCODE_HEALTH_TIMEOUT = "15 seconds";
 
 const OpenCodeHealthSchema = Schema.Struct({
   healthy: Schema.Literal(true),
