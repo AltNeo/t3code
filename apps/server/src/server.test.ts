@@ -148,6 +148,7 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
+import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
@@ -215,6 +216,7 @@ import {
   transferBudgetViolations,
 } from "../integration/TransferBudgetReport.integration.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+import { otlpSerializationLayer } from "@t3tools/shared/observability";
 
 const defaultProjectId = ProjectId.make("project-default");
 const defaultThreadId = ThreadId.make("thread-default");
@@ -575,6 +577,8 @@ const buildAppUnderTest = (options?: {
       otlpMetricsUrl: undefined,
       otlpExportIntervalMs: 10_000,
       otlpServiceName: "t3-server",
+      otlpHeaders: undefined,
+      otlpProtocol: "http/json",
       mode: "desktop",
       port: 0,
       host: "127.0.0.1",
@@ -924,9 +928,12 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide(
-        Layer.mock(TerminalManager.TerminalManager)({
-          ...options?.layers?.terminalManager,
-        }),
+        Layer.mergeAll(
+          Layer.mock(TerminalManager.TerminalManager)({
+            ...options?.layers?.terminalManager,
+          }),
+          WorktreeSetupTracker.layer,
+        ),
       ),
       Layer.provide(
         Layer.mergeAll(
@@ -1055,6 +1062,7 @@ const buildAppUnderTest = (options?: {
           ...options?.layers?.browserTraceCollector,
         }),
       ),
+      Layer.provide(otlpSerializationLayer(config.otlpProtocol)),
       Layer.provide(
         Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({
           publish: (event) => Effect.succeed({ ...(event as any), sequence: 1 }),
@@ -5257,6 +5265,110 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           contentType: "application/json",
         },
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("forwards browser OTLP traces as protobuf when the protocol is http/protobuf", () =>
+    Effect.gen(function* () {
+      const upstreamRequests: Array<{
+        readonly body: string;
+        readonly contentType: string | null;
+      }> = [];
+      const localTraceRecords: Array<unknown> = [];
+      // Produced by effect's own tracer, so enum fields are numeric and the
+      // protobuf encoder accepts them. The hand-written payload in the JSON
+      // test uses enum names, which only the JSON path tolerates.
+      const payload = yield* makeBrowserOtlpPayload("client.protobuf.test");
+
+      const collector = yield* Effect.acquireRelease(
+        Effect.promise(async () => {
+          const NodeHttp = await import("node:http");
+
+          return await new Promise<{
+            readonly close: () => Promise<void>;
+            readonly url: string;
+          }>((resolve, reject) => {
+            const server = NodeHttp.createServer((request, response) => {
+              const chunks: Buffer[] = [];
+              request.on("data", (chunk) => {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              });
+              request.on("end", () => {
+                upstreamRequests.push({
+                  body: Buffer.concat(chunks).toString("utf8"),
+                  contentType: request.headers["content-type"] ?? null,
+                });
+                response.statusCode = 204;
+                response.end();
+              });
+            });
+
+            server.on("error", reject);
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address();
+              if (!address || typeof address === "string") {
+                reject(new Error("Expected TCP collector address"));
+                return;
+              }
+
+              resolve({
+                url: `http://127.0.0.1:${address.port}/v1/traces`,
+                close: () =>
+                  new Promise<void>((resolveClose, rejectClose) => {
+                    server.close((error) => {
+                      if (error) {
+                        rejectClose(error);
+                        return;
+                      }
+                      resolveClose();
+                    });
+                  }),
+              });
+            });
+          });
+        }),
+        ({ close }) => Effect.promise(close),
+      );
+
+      yield* buildAppUnderTest({
+        config: {
+          otlpTracesUrl: collector.url,
+          otlpProtocol: "http/protobuf",
+        },
+        layers: {
+          browserTraceCollector: {
+            record: (records) =>
+              Effect.sync(() => {
+                localTraceRecords.push(...records);
+              }),
+          },
+        },
+      });
+
+      const response = yield* HttpClient.post("/api/observability/v1/traces", {
+        headers: {
+          cookie: yield* getAuthenticatedSessionCookieHeader(),
+          "content-type": "application/json",
+        },
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        body: HttpBody.text(JSON.stringify(payload), "application/json"),
+      });
+
+      assert.equal(response.status, 204);
+      // The local collector still decodes the browser's JSON before forwarding.
+      assert.equal(localTraceRecords.length, 1);
+      assert.equal(upstreamRequests.length, 1);
+      const forwarded = upstreamRequests[0];
+      assert.notEqual(forwarded, undefined);
+      if (!forwarded) {
+        return;
+      }
+      assert.equal(forwarded.contentType, "application/x-protobuf");
+      // Protobuf strings are raw UTF-8, so the span and service names survive
+      // the stub's utf8 decode even though the surrounding bytes don't.
+      assert.notEqual(forwarded.body[0], "{");
+      assert.include(forwarded.body, "client.protobuf.test");
+      assert.include(forwarded.body, "t3-web");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -10607,6 +10719,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               status: "started" as const,
               scriptId: "setup",
               scriptName: "Setup",
+              scriptCommand: "npm install",
               terminalId: "setup-setup",
               cwd: "/tmp/bootstrap-worktree",
             }),
@@ -10722,12 +10835,23 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "resolve-remote-commit",
           "create-worktree",
         ]);
-        assert.deepEqual(runForThread.mock.calls[0]?.[0], {
-          threadId: ThreadId.make("thread-bootstrap"),
-          projectId: defaultProjectId,
-          projectCwd: "/tmp/project",
-          worktreePath: "/tmp/bootstrap-worktree",
-        });
+        const runForThreadInput = runForThread.mock.calls[0]?.[0];
+        assert.deepEqual(
+          runForThreadInput && {
+            threadId: runForThreadInput.threadId,
+            projectId: runForThreadInput.projectId,
+            projectCwd: runForThreadInput.projectCwd,
+            worktreePath: runForThreadInput.worktreePath,
+          },
+          {
+            threadId: ThreadId.make("thread-bootstrap"),
+            projectId: defaultProjectId,
+            projectCwd: "/tmp/project",
+            worktreePath: "/tmp/bootstrap-worktree",
+          },
+        );
+        // Worktree bootstraps observe script completion so the setup card can show the exit code.
+        assert.isDefined(runForThreadInput?.observeCompletion);
         assert.deepEqual(refreshStatus.mock.calls[0]?.[0], "/tmp/bootstrap-worktree");
 
         const setupActivities = dispatchedCommands.filter(
@@ -11160,6 +11284,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             status: "started" as const,
             scriptId: "setup",
             scriptName: "Setup",
+            scriptCommand: "npm install",
             terminalId: "setup-setup",
             cwd: "/tmp/bootstrap-worktree",
           }),
