@@ -1,5 +1,24 @@
 name: Windows Pi nightly
 
+# Builds an unsigned Windows NSIS installer for this fork's `feat/pi-provider`
+# branch (rebased onto upstream main at build time) and publishes it as a
+# prerelease so fork users can update.
+#
+# Two things are deliberate here:
+#
+# 1. Every runner is GitHub-hosted (`ubuntu-24.04`, `windows-2025`). The
+#    `blacksmith-*` labels used by upstream queue forever for this fork.
+# 2. The Windows installer embeds the WSL backend, which means it needs the
+#    Linux CLI archive as its runtime payload. Upstream replaced the old
+#    `--wsl-prebuild` (a bare `pty.node`) with `--wsl-runtime` (the full Linux
+#    CLI archive, `t3-<version>-linux-<arch>.tar.gz`), so this workflow builds
+#    that archive on a Linux runner and hands it to the Windows build.
+#
+# The version is resolved once in `check-upstream` and shared by both build
+# jobs: `scripts/build-desktop-artifact.ts` rejects a WSL runtime archive whose
+# single top-level directory is not named `t3-<build-version>-linux-x64`, so
+# the archive version and `--build-version` have to agree exactly.
+
 on:
   workflow_dispatch:
   schedule:
@@ -17,6 +36,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - id: check
         name: Check for a new upstream commit
@@ -45,18 +65,31 @@ jobs:
               /upstream-main-sha: ([0-9a-f]{40})/i,
             )?.[1];
             const shouldBuild = context.eventName !== "schedule" || previousSha !== upstreamSha;
+            // Resolved here so both build jobs use the identical string: the
+            // Windows build stamps it as the app version and the Linux job
+            // names the CLI archive after it.
+            const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+            const version = `0.0.42-nightly.${date}.${context.runNumber}`;
             core.setOutput("should_build", String(shouldBuild));
             core.setOutput("upstream_sha", upstreamSha);
+            core.setOutput("version", version);
             core.notice(
-              `${shouldBuild ? "Building" : "Skipping"} upstream main ${upstreamSha}`,
+              `${shouldBuild ? "Building" : "Skipping"} upstream main ${upstreamSha} as ${version}`,
             );
 
-  build-wsl-node-pty:
-    name: Build WSL node-pty (linux-x64)
+  build-linux-cli:
+    name: Build Linux CLI archive (WSL runtime)
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
+    env:
+      # These are public identifiers, documented in .env.example and embedded
+      # in official T3 Code builds. They are not secrets.
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+      T3CODE_RELAY_URL: https://relay.t3.codes
 
     steps:
       - name: Checkout feature branch
@@ -81,34 +114,72 @@ jobs:
           run-install: false
 
       - name: Install dependencies
-        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
 
-      - name: Build node-pty linux-x64 prebuild
+      - name: Align package versions to the nightly version
+        # The archive smoke test runs `t3 --version` and expects this version,
+        # which the executable reports from the package manifests bundled at
+        # build time.
+        run: node scripts/update-release-package-versions.ts "${{ needs.check-upstream.outputs.version }}"
+
+      - name: Build server and web client
+        # Builds @t3tools/web#build, then the t3 bundle plus apps/server/dist/client.
+        run: vp run --filter t3 build
+
+      - name: Build CLI single-executable
+        shell: bash
+        env:
+          # The exact version, not a major: vp downloads it from nodejs.org/dist
+          # on the runner, and only exact versions have a dist directory. Keep
+          # in step with SEA_NODE_VERSION in apps/server/vite.config.ts.
+          VP_NODE_VERSION: "26.8.2"
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Stage resource monitor for the CLI archive
         shell: bash
         run: |
           set -euo pipefail
-          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
-          pty_dir="$(dirname "$pty_pkg")"
-          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
-          mkdir -p wsl-prebuild
-          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
-          file wsl-prebuild/pty.node
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$target_dir"
+          cp "native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor" "$target_dir/t3-resource-monitor"
+          file "$target_dir/t3-resource-monitor"
 
-      - name: Upload node-pty prebuild
+      - name: Build CLI archive
+        run: >-
+          node scripts/build-cli-archive.ts
+          --platform linux
+          --arch x64
+          --version "${{ needs.check-upstream.outputs.version }}"
+          --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor"
+          --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        shell: bash
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.check-upstream.outputs.version }}"
+
+      - name: Upload CLI archive
         uses: actions/upload-artifact@v4
         with:
-          name: wsl-node-pty-x64
-          path: wsl-prebuild/pty.node
+          name: cli-linux-x64
+          path: release-cli/*
           if-no-files-found: error
 
   build:
     name: Build Windows installer
-    needs: [check-upstream, build-wsl-node-pty]
+    needs: [check-upstream, build-linux-cli]
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ needs.check-upstream.outputs.version }}
       upstream_sha: ${{ needs.check-upstream.outputs.upstream_sha }}
     env:
       # These are public identifiers, documented in .env.example and embedded
@@ -153,16 +224,13 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - id: version
-        name: Resolve nightly version
-        shell: bash
-        run: echo "version=0.0.42-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
-
-      - name: Download WSL node-pty prebuild
+      - name: Download Linux CLI archive for WSL
+        # Embedded as the WSL backend's runtime. The archive is built by
+        # build-linux-cli from the same commit and the same version string.
         uses: actions/download-artifact@v4
         with:
-          name: wsl-node-pty-x64
-          path: wsl-prebuild
+          name: cli-linux-x64
+          path: wsl-runtime
 
       - name: Build unsigned installer
         shell: pwsh
@@ -171,8 +239,8 @@ jobs:
           --platform win
           --target nsis
           --arch x64
-          --wsl-prebuild "${{ github.workspace }}\wsl-prebuild\pty.node"
-          --build-version "${{ steps.version.outputs.version }}"
+          --wsl-runtime "${{ github.workspace }}\wsl-runtime\t3-${{ needs.check-upstream.outputs.version }}-linux-x64.tar.gz"
+          --build-version "${{ needs.check-upstream.outputs.version }}"
           --verbose
 
       - name: Upload installer
@@ -211,7 +279,7 @@ jobs:
           make_latest: false
           generate_release_notes: true
           body: |
-            Automated unsigned Windows build for the Pi provider branch.
+            Automated unsigned Windows build for the Pi provider branch, with the WSL backend (embedded Linux CLI runtime).
 
             upstream-main-sha: ${{ needs.build.outputs.upstream_sha }}
             feature-ref: feat/pi-provider
