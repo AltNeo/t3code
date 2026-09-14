@@ -2708,6 +2708,55 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("issues cloud link proofs for a WSL-style advertised environment origin", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const linkProofUrl = yield* getHttpServerUrl("/api/connect/link-proof");
+      const serverPort = Number(new URL(linkProofUrl).port);
+      const advertisedHost = `172.27.0.99:${serverPort}`;
+      const advertisedHttpBaseUrl = `http://${advertisedHost}`;
+      const linkProofResponse = yield* HttpClient.post("/api/connect/link-proof", {
+        headers: {
+          cookie: yield* getAuthenticatedSessionCookieHeader(),
+          "content-type": "application/json",
+          host: advertisedHost,
+        },
+        body: HttpBody.text(
+          jsonRequestBody({
+            challenge: "relay-link-challenge",
+            relayIssuer: "https://relay.example.test",
+            endpoint: {
+              httpBaseUrl: advertisedHttpBaseUrl,
+              wsBaseUrl: `ws://${advertisedHost}/ws`,
+              providerKind: "manual",
+            },
+            origin: {
+              localHttpHost: "127.0.0.1",
+              localHttpPort: serverPort,
+            },
+          }),
+          "application/json",
+        ),
+      });
+      const body = (yield* linkProofResponse.json) as unknown;
+
+      assert.equal(linkProofResponse.status, 200);
+      assert.equal(typeof body, "string");
+      const payload = decodeCompactJwtPayload<{
+        readonly challenge: string;
+        readonly endpoint: { readonly httpBaseUrl: string };
+        readonly origin: { readonly localHttpHost: string; readonly localHttpPort: number };
+      }>(body as string);
+      assert.equal(payload.challenge, "relay-link-challenge");
+      assert.equal(payload.endpoint.httpBaseUrl, advertisedHttpBaseUrl);
+      assert.deepEqual(payload.origin, {
+        localHttpHost: "127.0.0.1",
+        localHttpPort: serverPort,
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("rejects cloud link proofs for unsupported endpoint providers", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

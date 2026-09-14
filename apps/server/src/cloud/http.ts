@@ -297,9 +297,16 @@ function endpointRequestPort(url: URL): number {
   return Number(url.port || (url.protocol === "https:" ? 443 : 80));
 }
 
-function isAllowedEndpointOrigin(input: {
+// The link proof must be requested against the environment's own API: either
+// a loopback address, or the environment's advertised endpoint origin. Desktop
+// WSL-only backends advertise the WSL distro's eth0 IP as their renderer-visible
+// URL (wslhost loopback forwarding is unreliable on some Windows hosts), so the
+// proof request legitimately carries that non-loopback Host when the client
+// links to the advertised endpoint.
+export function isAllowedEndpointOrigin(input: {
   readonly origin: RelayManagedEndpointOrigin;
   readonly requestUrl: string;
+  readonly endpointHttpBaseUrl: string;
 }): boolean {
   if (!isLoopbackHostname(input.origin.localHttpHost)) {
     return false;
@@ -307,7 +314,15 @@ function isAllowedEndpointOrigin(input: {
 
   const url = new URL(input.requestUrl);
   if (!isLoopbackHostname(url.hostname)) {
-    return false;
+    let endpointUrl: URL | null = null;
+    try {
+      endpointUrl = new URL(input.endpointHttpBaseUrl);
+    } catch {
+      return false;
+    }
+    if (normalizeHostname(url.hostname) !== normalizeHostname(endpointUrl.hostname)) {
+      return false;
+    }
   }
 
   return input.origin.localHttpPort === endpointRequestPort(url);
@@ -385,6 +400,7 @@ const makeCloudLinkProof = Effect.fn("environment.cloud.makeLinkProof")(function
     !isAllowedEndpointOrigin({
       origin: request.origin,
       requestUrl,
+      endpointHttpBaseUrl: request.endpoint.httpBaseUrl,
     })
   ) {
     return yield* new EnvironmentHttpBadRequestError({

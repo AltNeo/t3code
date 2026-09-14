@@ -33,6 +33,7 @@ import type { RelayLinkProofRequest } from "@t3tools/contracts/relay";
 import { CLOUD_ENDPOINT_RUNTIME_CONFIG, RELAY_URL_SECRET } from "./config.ts";
 import {
   consumeCloudReplayGuards,
+  isAllowedEndpointOrigin,
   isSupportedLinkProviderKind,
   linkProofScopes,
   pendingServiceUpdateExists,
@@ -607,5 +608,74 @@ describe("link proof provider kinds", () => {
       "managed_tunnels",
     ]);
     expect(linkProofScopes(proofRequest("manual"))).toEqual(["agent_activity_notifications"]);
+  });
+});
+
+describe("link proof endpoint origins", () => {
+  const originRequest = (input: {
+    readonly localHttpHost?: string;
+    readonly localHttpPort?: number;
+    readonly requestUrl?: string;
+    readonly endpointHttpBaseUrl?: string;
+  }) => ({
+    origin: {
+      localHttpHost: input.localHttpHost ?? "127.0.0.1",
+      localHttpPort: input.localHttpPort ?? 3773,
+    },
+    requestUrl: input.requestUrl ?? "http://127.0.0.1:3773/api/connect/link-proof",
+    endpointHttpBaseUrl: input.endpointHttpBaseUrl ?? "http://127.0.0.1:3773",
+  });
+
+  it("accepts loopback proof requests on the declared port", () => {
+    expect(isAllowedEndpointOrigin(originRequest({}))).toBe(true);
+  });
+
+  it("rejects loopback proof requests on another port", () => {
+    expect(isAllowedEndpointOrigin(originRequest({ localHttpPort: 3774 }))).toBe(false);
+  });
+
+  it("accepts a WSL-style host that matches the advertised endpoint", () => {
+    expect(
+      isAllowedEndpointOrigin(
+        originRequest({
+          requestUrl: "http://172.27.0.99:3773/api/connect/link-proof",
+          endpointHttpBaseUrl: "http://172.27.0.99:3773",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a WSL-style host that does not match the advertised endpoint", () => {
+    expect(
+      isAllowedEndpointOrigin(
+        originRequest({
+          requestUrl: "http://172.27.0.99:3773/api/connect/link-proof",
+          endpointHttpBaseUrl: "http://172.27.0.100:3773",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a WSL-style host when the advertised endpoint is unusable", () => {
+    expect(
+      isAllowedEndpointOrigin(
+        originRequest({
+          requestUrl: "http://172.27.0.99:3773/api/connect/link-proof",
+          endpointHttpBaseUrl: "not a url",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects non-loopback managed endpoint origins", () => {
+    expect(
+      isAllowedEndpointOrigin(
+        originRequest({
+          localHttpHost: "192.168.1.42",
+          requestUrl: "http://172.27.0.99:3773/api/connect/link-proof",
+          endpointHttpBaseUrl: "http://172.27.0.99:3773",
+        }),
+      ),
+    ).toBe(false);
   });
 });
